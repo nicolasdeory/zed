@@ -477,6 +477,7 @@ pub struct EditPredictionSettings {
     /// Settings specific to Ollama.
     pub ollama: Option<OpenAiCompatibleEditPredictionSettings>,
     pub open_ai_compatible_api: Option<OpenAiCompatibleEditPredictionSettings>,
+    pub external: ExternalEditPredictionSettings,
     /// Controls whether training data collection is enabled.
     ///
     /// `Default` means the value stored in the legacy KV store is used as a fallback,
@@ -537,6 +538,20 @@ pub struct OpenAiCompatibleEditPredictionSettings {
     /// The prompt format to use for completions. When `None`, the format
     /// will be derived from the model name at request time.
     pub prompt_format: EditPredictionPromptFormat,
+}
+
+#[derive(Clone, Debug)]
+pub struct ExternalEditPredictionSettings {
+    /// Structured edit prediction endpoint.
+    pub api_url: Arc<str>,
+}
+
+impl Default for ExternalEditPredictionSettings {
+    fn default() -> Self {
+        Self {
+            api_url: "http://127.0.0.1:17878/predict".into(),
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
@@ -872,6 +887,13 @@ impl settings::Settings for AllLanguageSettings {
                 api_url: api_url.into(),
                 prompt_format: openai_compatible_settings.prompt_format.unwrap().into(),
             });
+        let external_settings = edit_predictions.external.unwrap();
+        let external_settings = ExternalEditPredictionSettings {
+            api_url: external_settings
+                .api_url
+                .unwrap_or_else(|| "http://127.0.0.1:17878/predict".to_string())
+                .into(),
+        };
 
         let mut file_types: FxHashMap<Arc<str>, (GlobSet, Vec<String>)> = FxHashMap::default();
 
@@ -910,6 +932,7 @@ impl settings::Settings for AllLanguageSettings {
                 codestral: codestral_settings,
                 ollama: ollama_settings,
                 open_ai_compatible_api: openai_compatible_settings,
+                external: external_settings,
                 allow_data_collection: edit_predictions.allow_data_collection.unwrap_or_default(),
             },
             defaults: default_language_settings,

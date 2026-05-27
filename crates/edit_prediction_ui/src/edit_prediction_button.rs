@@ -321,6 +321,69 @@ impl Render for EditPredictionButton {
                         .with_handle(self.popover_menu_handle.clone()),
                 )
             }
+            EditPredictionProvider::External => {
+                let enabled = self.editor_enabled.unwrap_or(true);
+                let this = cx.weak_entity();
+                let file = self.file.clone();
+                let language = self.language.clone();
+                let project = self.project.clone();
+
+                let icons = self
+                    .edit_prediction_provider
+                    .as_ref()
+                    .map(|p| p.icons(cx))
+                    .unwrap_or_else(|| {
+                        edit_prediction_types::EditPredictionIconSet::new(IconName::AiEdit)
+                    });
+                let icon = if enabled { icons.base } else { icons.disabled };
+
+                div().child(
+                    PopoverMenu::new("external-edit-prediction")
+                        .on_open({
+                            let file = file.clone();
+                            let language = language;
+                            let project = project;
+                            Rc::new(move |_window, cx| {
+                                emit_edit_prediction_menu_opened(
+                                    "external", &file, &language, &project, cx,
+                                );
+                            })
+                        })
+                        .menu(move |window, cx| {
+                            this.update(cx, |this, cx| {
+                                this.build_edit_prediction_context_menu(
+                                    EditPredictionProvider::External,
+                                    window,
+                                    cx,
+                                )
+                            })
+                            .ok()
+                        })
+                        .anchor(Anchor::BottomRight)
+                        .trigger_with_tooltip(
+                            IconButton::new("external-edit-prediction-icon", icon)
+                                .shape(IconButtonShape::Square)
+                                .when(!enabled, |this| {
+                                    this.indicator(Indicator::dot().color(Color::Ignored))
+                                        .indicator_border_color(Some(
+                                            cx.theme().colors().status_bar_background,
+                                        ))
+                                }),
+                            move |_window, cx| {
+                                let settings = all_language_settings(None, cx);
+                                let tooltip_meta =
+                                    settings.edit_predictions.external.api_url.to_string();
+                                Tooltip::with_meta(
+                                    "Edit Prediction",
+                                    Some(&ToggleMenu),
+                                    &tooltip_meta,
+                                    cx,
+                                )
+                            },
+                        )
+                        .with_handle(self.popover_menu_handle.clone()),
+                )
+            }
             provider @ (EditPredictionProvider::Zed | EditPredictionProvider::Mercury) => {
                 let enabled = self.editor_enabled.unwrap_or(true);
                 let file = self.file.clone();
@@ -1467,6 +1530,11 @@ pub fn get_available_providers(cx: &mut App) -> Vec<EditPredictionProvider> {
         .is_some()
     {
         providers.push(EditPredictionProvider::OpenAiCompatibleApi);
+    }
+
+    if all_language_settings(None, cx).edit_predictions.provider == EditPredictionProvider::External
+    {
+        providers.push(EditPredictionProvider::External);
     }
 
     if edit_prediction::mercury::mercury_api_token(cx)

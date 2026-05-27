@@ -288,7 +288,7 @@ After adding your API key, Codestral will appear in the provider dropdown in the
 
 ### Local and self-hosted models
 
-You can use local or self-hosted edit prediction models through Ollama or any server that implements the OpenAI completion API format. This works with Ollama, vLLM, llama.cpp server, LocalAI, and other compatible servers.
+You can use local or self-hosted edit prediction models through Ollama, any server that implements the OpenAI completion API format, or a structured external edit prediction server. This works with Ollama, vLLM, llama.cpp server, LocalAI, and other compatible servers.
 
 #### Ollama
 
@@ -385,6 +385,56 @@ Your OpenAI-compatible server must implement the OpenAI `/v1/completions` endpoi
   "max_tokens": 256,
   "temperature": 0.2,
   "stop": ["<|endoftext|>", ...]
+}
+```
+
+#### Structured external servers
+
+Set `external` as your provider when your local server returns structured edits or jump targets instead of plain completion text:
+
+```json [settings]
+{
+  "edit_predictions": {
+    "provider": "external",
+    "external": {
+      "api_url": "http://127.0.0.1:17878/predict"
+    }
+  }
+}
+```
+
+External edit prediction servers receive POST requests with this format:
+
+```json
+{
+  "version": 1,
+  "path": "src/main.rs",
+  "absolute_path": "/Users/example/project/src/main.rs",
+  "workspace_root": "/Users/example/project",
+  "language": "Rust",
+  "contents": "fn main() {\n",
+  "cursor": { "line": 0, "column": 11 }
+}
+```
+
+They should return edits in the active file, a jump target, or both:
+
+```json
+{
+  "id": "request-id",
+  "edits": [
+    {
+      "range": {
+        "start": { "line": 0, "column": 11 },
+        "end": { "line": 0, "column": 11 }
+      },
+      "text": "\n    println!(\"hello\");\n}"
+    }
+  ],
+  "jump": {
+    "path": "src/lib.rs",
+    "position": { "line": 12, "column": 0 }
+  }
 }
 ```
 

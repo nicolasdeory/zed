@@ -1713,6 +1713,9 @@
       "prompt_format": "infer",
       "max_output_tokens": 64,
     },
+    "external": {
+      "api_url": "http://127.0.0.1:17878/predict",
+    },
     // Controls whether Zed may collect training data when using Zed's Edit Predictions.
     // Data is only captured when the project is detected as open source.
     // Possible values:

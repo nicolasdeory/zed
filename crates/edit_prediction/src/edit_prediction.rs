@@ -68,6 +68,7 @@ use util::{RangeExt as _, ResultExt as _};
 
 pub mod cursor_excerpt;
 pub mod example_spec;
+pub mod external;
 pub mod fim;
 mod license_detection;
 pub mod mercury;
@@ -2308,6 +2309,7 @@ fn is_ep_store_provider(provider: EditPredictionProvider) -> bool {
         | EditPredictionProvider::OpenAiCompatibleApi => true,
         EditPredictionProvider::None
         | EditPredictionProvider::Copilot
+        | EditPredictionProvider::External
         | EditPredictionProvider::Codestral => false,
     }
 }
@@ -2345,6 +2347,7 @@ impl EditPredictionStore {
                 EditPredictionProvider::OpenAiCompatibleApi => (false, 2),
                 EditPredictionProvider::None
                 | EditPredictionProvider::Copilot
+                | EditPredictionProvider::External
                 | EditPredictionProvider::Codestral => {
                     log::error!("queue_prediction_refresh called with non-store provider");
                     return;

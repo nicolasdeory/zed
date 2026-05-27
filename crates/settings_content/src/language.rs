@@ -87,6 +87,7 @@ pub enum EditPredictionProvider {
     Codestral,
     Ollama,
     OpenAiCompatibleApi,
+    External,
     Mercury,
 }
 
@@ -99,6 +100,7 @@ impl EditPredictionProvider {
             | EditPredictionProvider::Codestral
             | EditPredictionProvider::Ollama
             | EditPredictionProvider::OpenAiCompatibleApi
+            | EditPredictionProvider::External
             | EditPredictionProvider::Mercury => false,
         }
     }
@@ -112,6 +114,7 @@ impl EditPredictionProvider {
             EditPredictionProvider::None => None,
             EditPredictionProvider::Ollama => Some("Ollama"),
             EditPredictionProvider::OpenAiCompatibleApi => Some("OpenAI-Compatible API"),
+            EditPredictionProvider::External => Some("External Edit Prediction"),
         }
     }
 }
@@ -137,6 +140,8 @@ pub struct EditPredictionSettingsContent {
     pub ollama: Option<OllamaEditPredictionSettingsContent>,
     /// Settings specific to using custom OpenAI-compatible servers for edit prediction.
     pub open_ai_compatible_api: Option<CustomEditPredictionProviderSettingsContent>,
+    /// Settings specific to using a local structured edit prediction server.
+    pub external: Option<ExternalEditPredictionSettingsContent>,
     /// Controls whether Zed may collect training data when using Zed's Edit Predictions.
     /// Data is only ever captured for files in projects that are detected as open source.
     ///
@@ -166,6 +171,15 @@ pub struct CustomEditPredictionProviderSettingsContent {
     ///
     /// Default: 256
     pub max_output_tokens: Option<u32>,
+}
+
+#[with_fallible_options]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema, MergeFrom, PartialEq)]
+pub struct ExternalEditPredictionSettingsContent {
+    /// Api URL to use for structured edit predictions.
+    ///
+    /// Default: "http://127.0.0.1:17878/predict"
+    pub api_url: Option<String>,
 }
 
 #[derive(

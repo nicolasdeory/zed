@@ -2,7 +2,9 @@ use client::{Client, UserStore};
 use codestral::{CodestralEditPredictionDelegate, load_codestral_api_key};
 use collections::HashMap;
 use copilot::CopilotEditPredictionDelegate;
-use edit_prediction::{EditPredictionModel, ZedEditPredictionDelegate};
+use edit_prediction::{
+    EditPredictionModel, ZedEditPredictionDelegate, external::ExternalEditPredictionDelegate,
+};
 use editor::Editor;
 use gpui::{AnyWindowHandle, App, AppContext as _, Context, Entity, WeakEntity};
 use language::{
@@ -120,6 +122,7 @@ fn edit_prediction_provider_config_for_settings(cx: &App) -> Option<EditPredicti
             Some(EditPredictionProviderConfig::Zed(EditPredictionModel::Zeta))
         }
         EditPredictionProvider::Codestral => Some(EditPredictionProviderConfig::Codestral),
+        EditPredictionProvider::External => Some(EditPredictionProviderConfig::External),
         EditPredictionProvider::Ollama | EditPredictionProvider::OpenAiCompatibleApi => {
             let custom_settings = if provider == EditPredictionProvider::Ollama {
                 settings.ollama.as_ref()?
@@ -175,6 +178,7 @@ fn infer_prompt_format(model: &str) -> Option<EditPredictionPromptFormat> {
 enum EditPredictionProviderConfig {
     Copilot,
     Codestral,
+    External,
     Zed(EditPredictionModel),
 }
 
@@ -183,6 +187,7 @@ impl EditPredictionProviderConfig {
         match self {
             EditPredictionProviderConfig::Copilot => "Copilot",
             EditPredictionProviderConfig::Codestral => "Codestral",
+            EditPredictionProviderConfig::External => "External",
             EditPredictionProviderConfig::Zed(model) => match model {
                 EditPredictionModel::Zeta => "Zeta",
                 EditPredictionModel::Fim { .. } => "FIM",
@@ -273,6 +278,23 @@ fn assign_edit_prediction_provider(
         Some(EditPredictionProviderConfig::Codestral) => {
             let http_client = client.http_client();
             let provider = cx.new(|_| CodestralEditPredictionDelegate::new(http_client));
+            editor.set_edit_prediction_provider(Some(provider), window, cx);
+        }
+        Some(EditPredictionProviderConfig::External) => {
+            let Some(project) = editor.project().cloned() else {
+                return;
+            };
+            let ep_store = edit_prediction::EditPredictionStore::global(client, &user_store, cx);
+            ep_store.update(cx, |ep_store, cx| {
+                if let Some(buffer) = &singleton_buffer {
+                    ep_store.register_buffer(buffer, &project, cx);
+                } else {
+                    ep_store.register_project(&project, cx);
+                }
+            });
+            let provider = cx.new(|_| {
+                ExternalEditPredictionDelegate::new(project, ep_store, client.http_client())
+            });
             editor.set_edit_prediction_provider(Some(provider), window, cx);
         }
         Some(EditPredictionProviderConfig::Zed(model)) => {
