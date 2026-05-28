@@ -395,6 +395,12 @@ impl Editor {
                     Self::open_editor_at_anchor(snapshot, *target, &workspace, window, cx)
                         .detach_and_log_err(cx);
                 }
+                if let Some(provider) = self.edit_prediction_provider() {
+                    provider.accept(cx);
+                }
+                self.active_edit_prediction = None;
+                self.stale_edit_prediction_in_menu = None;
+                cx.notify();
             }
             EditPrediction::Edit {
                 edits,
