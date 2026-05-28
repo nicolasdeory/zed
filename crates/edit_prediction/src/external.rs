@@ -6,16 +6,16 @@ use edit_prediction_types::{
 };
 use futures::AsyncReadExt as _;
 use gpui::{
-    App, AsyncApp, Context, Entity, Task,
+    App, AsyncApp, Context, Entity, Task, TaskExt as _,
     http_client::{self, AsyncBody, HttpClient},
 };
 use icons::IconName;
 use language::{Anchor, Buffer, BufferSnapshot, EditPreview, Point, ToOffset as _, ToPoint as _};
-use project::Project;
+use project::{CodeAction, LspAction, Project};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ops::Range,
     path::{Path, PathBuf},
     sync::Arc,
@@ -26,6 +26,7 @@ use text::Bias;
 enum CurrentExternalPrediction {
     Local {
         id: Option<Arc<str>>,
+        buffer: Entity<Buffer>,
         snapshot: BufferSnapshot,
         edits: Arc<[(Range<Anchor>, Arc<str>)]>,
         edit_preview: EditPreview,
@@ -196,8 +197,16 @@ impl EditPredictionDelegate for ExternalEditPredictionDelegate {
         }));
     }
 
-    fn accept(&mut self, _cx: &mut Context<Self>) {
-        self.current_prediction = None;
+    fn accept(&mut self, cx: &mut Context<Self>) {
+        if let Some(CurrentExternalPrediction::Local { buffer, edits, .. }) =
+            self.current_prediction.take()
+        {
+            let project = self.project.clone();
+            cx.spawn(async move |_, cx| {
+                apply_import_quick_fix_after_accept(project, buffer, edits, cx).await
+            })
+            .detach_and_log_err(cx);
+        }
         self.pending_request = None;
     }
 
@@ -215,6 +224,7 @@ impl EditPredictionDelegate for ExternalEditPredictionDelegate {
         match self.current_prediction.as_ref()? {
             CurrentExternalPrediction::Local {
                 id,
+                buffer: _,
                 snapshot,
                 edits,
                 edit_preview,
@@ -359,7 +369,14 @@ fn build_cursor_request(
             (history["fileName"].as_str()? == relative_path).then(|| history["diffHistory"].clone())
         })
         .unwrap_or_else(|| json!([]));
-    let additional_files = cursor_additional_files(&related_files);
+    let mut additional_files = cursor_additional_files(&related_files);
+    append_open_buffer_additional_files(
+        &mut additional_files,
+        project,
+        &relative_path,
+        workspace_root,
+        cx,
+    );
     let code_results = cursor_code_results(&related_files);
     let linter_errors = cursor_linter_errors(
         &relative_path,
@@ -495,6 +512,64 @@ fn cursor_additional_files(related_files: &[zeta_prompt::RelatedFile]) -> Vec<Va
         .collect()
 }
 
+fn append_open_buffer_additional_files(
+    additional_files: &mut Vec<Value>,
+    project: &Entity<Project>,
+    current_relative_path: &str,
+    workspace_root: Option<&str>,
+    cx: &mut App,
+) {
+    const MAX_OPEN_BUFFERS: usize = 8;
+    const MAX_OPEN_BUFFER_LINES: u32 = 200;
+
+    let mut seen_paths = additional_files
+        .iter()
+        .filter_map(|file| file["relativeWorkspacePath"].as_str().map(String::from))
+        .collect::<HashSet<_>>();
+    seen_paths.insert(current_relative_path.to_string());
+
+    for buffer in project
+        .read(cx)
+        .opened_buffers(cx)
+        .into_iter()
+        .take(MAX_OPEN_BUFFERS)
+    {
+        let snapshot = buffer.read(cx).snapshot();
+        let Some(file) = snapshot.file() else {
+            continue;
+        };
+        let path = file.full_path(cx).to_string_lossy().into_owned();
+        let absolute_path = file
+            .as_local()
+            .map(|file| file.abs_path(cx).to_string_lossy().into_owned());
+        let relative_path = relative_cursor_path(&path, absolute_path.as_deref(), workspace_root);
+        if !seen_paths.insert(relative_path.clone()) {
+            continue;
+        }
+
+        let max_point = snapshot.max_point();
+        let end_row = max_point.row.min(MAX_OPEN_BUFFER_LINES.saturating_sub(1));
+        let end = Point::new(end_row, snapshot.line_len(end_row));
+        let text = snapshot
+            .text_for_range(Point::new(0, 0)..end)
+            .collect::<String>();
+        if text.trim().is_empty() {
+            continue;
+        }
+
+        additional_files.push(json!({
+            "relativeWorkspacePath": relative_path,
+            "isOpen": true,
+            "visibleRangeContent": [text],
+            "startLineNumberOneIndexed": [1],
+            "visibleRanges": [{
+                "startLineNumber": 1,
+                "endLineNumberInclusive": end_row + 1,
+            }],
+        }));
+    }
+}
+
 fn cursor_code_results(related_files: &[zeta_prompt::RelatedFile]) -> Vec<Value> {
     related_files
         .iter()
@@ -592,6 +667,8 @@ async fn prediction_from_response(
             let jump = ExternalJump {
                 path: edit.path.unwrap_or_default(),
                 position: edit.range.start,
+                expected_content: None,
+                _should_retrigger: None,
             };
             return jump_prediction(project, response.id.clone(), jump, cx).await;
         }
@@ -611,6 +688,7 @@ async fn prediction_from_response(
             .await;
         return Ok(Some(CurrentExternalPrediction::Local {
             id: response.id.map(Into::into),
+            buffer: buffer.clone(),
             snapshot: snapshot.clone(),
             edits,
             edit_preview,
@@ -622,6 +700,108 @@ async fn prediction_from_response(
     }
 
     Ok(None)
+}
+
+async fn apply_import_quick_fix_after_accept(
+    project: Entity<Project>,
+    buffer: Entity<Buffer>,
+    edits: Arc<[(Range<Anchor>, Arc<str>)]>,
+    cx: &mut AsyncApp,
+) -> Result<()> {
+    const RETRY_DELAYS_MS: [u64; 4] = [100, 250, 500, 900];
+
+    for delay_ms in RETRY_DELAYS_MS {
+        cx.background_executor()
+            .timer(std::time::Duration::from_millis(delay_ms))
+            .await;
+
+        let actions = project
+            .update(cx, |project, cx| {
+                let snapshot = buffer.read(cx).snapshot();
+                let range = accepted_edit_search_range(&snapshot, &edits);
+                project.code_actions(
+                    &buffer,
+                    range,
+                    Some(vec![lsp::CodeActionKind::QUICKFIX]),
+                    cx,
+                )
+            })
+            .await?
+            .unwrap_or_default();
+
+        let Some(action) = select_import_quick_fix(actions) else {
+            continue;
+        };
+
+        project
+            .update(cx, |project, cx| {
+                project.apply_code_action(buffer.clone(), action, false, cx)
+            })
+            .await?;
+        return Ok(());
+    }
+
+    Ok(())
+}
+
+fn accepted_edit_search_range(
+    snapshot: &BufferSnapshot,
+    edits: &[(Range<Anchor>, Arc<str>)],
+) -> Range<Point> {
+    let mut start_row = u32::MAX;
+    let mut end_row = 0;
+
+    for (range, text) in edits {
+        let start = range.start.to_point(snapshot);
+        let end = range.end.to_point(snapshot);
+        start_row = start_row.min(start.row);
+        end_row = end_row
+            .max(start.row + text.chars().filter(|ch| *ch == '\n').count() as u32)
+            .max(end.row);
+    }
+
+    if start_row == u32::MAX {
+        start_row = 0;
+    }
+
+    let max_point = snapshot.max_point();
+    let start = Point::new(start_row.saturating_sub(3), 0);
+    let end = Point::new((end_row + 3).min(max_point.row), max_point.column);
+    start..end
+}
+
+fn select_import_quick_fix(actions: Vec<CodeAction>) -> Option<CodeAction> {
+    actions.into_iter().find(is_import_quick_fix)
+}
+
+fn is_import_quick_fix(action: &CodeAction) -> bool {
+    if let LspAction::Action(action) = &action.lsp_action
+        && action.disabled.is_some()
+    {
+        return false;
+    }
+
+    if action.lsp_action.action_kind().is_some_and(|kind| {
+        !code_action_kind_matches(&lsp::CodeActionKind::QUICKFIX, &kind)
+    })
+    {
+        return false;
+    }
+
+    let title = action.lsp_action.title().to_ascii_lowercase();
+    title.contains("import")
+        && !title.contains("organize imports")
+        && !title.contains("remove")
+        && !title.contains("unused")
+}
+
+fn code_action_kind_matches(requested: &lsp::CodeActionKind, actual: &lsp::CodeActionKind) -> bool {
+    let requested = requested.as_str();
+    let actual = actual.as_str();
+    actual == requested
+        || actual
+            .strip_prefix(requested)
+            .is_some_and(|suffix| suffix.starts_with('.'))
 }
 
 async fn jump_prediction(
@@ -641,7 +821,7 @@ async fn jump_prediction(
         .await?;
     let (snapshot, target) = target_buffer.read_with(cx, |buffer, _cx| {
         let snapshot = buffer.snapshot();
-        let target = snapshot.anchor_before(point_for_position(&snapshot, jump.position));
+        let target = snapshot.anchor_before(point_for_jump(&snapshot, &jump));
         (snapshot, target)
     });
 
@@ -654,6 +834,49 @@ async fn jump_prediction(
 
 fn point_for_position(snapshot: &BufferSnapshot, position: ExternalPosition) -> Point {
     snapshot.clip_point(Point::new(position.line, position.column), Bias::Left)
+}
+
+fn point_for_jump(snapshot: &BufferSnapshot, jump: &ExternalJump) -> Point {
+    let fallback = point_for_position(snapshot, jump.position);
+    let Some(expected_content) = jump
+        .expected_content
+        .as_ref()
+        .map(|content| content.trim())
+        .filter(|content| !content.is_empty())
+    else {
+        return fallback;
+    };
+
+    let contents = snapshot
+        .text_for_range(Point::new(0, 0)..snapshot.max_point())
+        .collect::<String>();
+    let lines = contents.split('\n').collect::<Vec<_>>();
+    if lines.is_empty() {
+        return fallback;
+    }
+
+    let target_row = fallback.row.min(lines.len().saturating_sub(1) as u32);
+    for distance in 0..=8 {
+        for row in [
+            target_row.checked_sub(distance),
+            target_row.checked_add(distance),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let Some(line) = lines.get(row as usize) else {
+                continue;
+            };
+            if let Some(column) = line.find(expected_content) {
+                return Point::new(row, column as u32);
+            }
+            if line.trim() == expected_content {
+                return Point::new(row, line.len().saturating_sub(line.trim_start().len()) as u32);
+            }
+        }
+    }
+
+    fallback
 }
 
 #[derive(Serialize)]
@@ -694,6 +917,10 @@ struct ExternalEdit {
 struct ExternalJump {
     path: String,
     position: ExternalPosition,
+    #[serde(default)]
+    expected_content: Option<String>,
+    #[serde(default, rename = "should_retrigger")]
+    _should_retrigger: Option<bool>,
 }
 
 #[derive(Deserialize)]
