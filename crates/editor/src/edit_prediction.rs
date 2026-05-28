@@ -399,6 +399,7 @@ impl Editor {
                     }
                     self.active_edit_prediction = None;
                     self.stale_edit_prediction_in_menu = None;
+                    self.refresh_edit_prediction(false, true, window, cx);
                     cx.notify();
                 }
             }

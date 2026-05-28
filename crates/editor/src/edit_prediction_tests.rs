@@ -339,6 +339,11 @@ async fn test_edit_prediction_jump_button(cx: &mut gpui::TestAppContext) {
             1,
             "accepting a same-file jump should notify the provider"
         );
+        assert_eq!(
+            provider.read(cx).refresh_count.load(atomic::Ordering::SeqCst),
+            1,
+            "accepting a same-file jump should request the next prediction at the target"
+        );
     });
     cx.assert_editor_state(indoc! {"
         line 0
@@ -375,6 +380,11 @@ async fn test_edit_prediction_jump_button(cx: &mut gpui::TestAppContext) {
             provider.read(cx).accept_count.load(atomic::Ordering::SeqCst),
             2,
             "each accepted same-file jump should notify the provider"
+        );
+        assert_eq!(
+            provider.read(cx).refresh_count.load(atomic::Ordering::SeqCst),
+            2,
+            "each accepted same-file jump should request a follow-up prediction"
         );
     });
     cx.assert_editor_state(indoc! {"
