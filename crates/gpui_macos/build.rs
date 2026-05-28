@@ -124,9 +124,11 @@ mod macos_build {
     fn compile_metal_shaders(header_path: &Path) {
         use std::process::{self, Command};
         let shader_path = "./src/shaders.metal";
-        let air_output_path = PathBuf::from(env::var("OUT_DIR").unwrap()).join("shaders.air");
-        let metallib_output_path =
-            PathBuf::from(env::var("OUT_DIR").unwrap()).join("shaders.metallib");
+        let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+        let air_output_path = out_dir.join("shaders.air");
+        let metallib_output_path = out_dir.join("shaders.metallib");
+        let modules_cache_path = out_dir.join("metal-module-cache");
+        std::fs::create_dir_all(&modules_cache_path).unwrap();
         println!("cargo:rerun-if-changed={}", shader_path);
 
         let output = Command::new("xcrun")
@@ -139,6 +141,7 @@ mod macos_build {
                 "-MO",
                 "-c",
                 shader_path,
+                &format!("-fmodules-cache-path={}", modules_cache_path.display()),
                 "-include",
                 (header_path.to_str().unwrap()),
                 "-o",
