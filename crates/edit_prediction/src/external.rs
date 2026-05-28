@@ -739,7 +739,10 @@ async fn apply_import_quick_fix_after_accept(
                 project.code_actions(
                     &buffer,
                     range,
-                    Some(vec![lsp::CodeActionKind::QUICKFIX]),
+                    Some(vec![
+                        lsp::CodeActionKind::QUICKFIX,
+                        lsp::CodeActionKind::SOURCE,
+                    ]),
                     cx,
                 )
             })
@@ -825,22 +828,41 @@ fn select_import_quick_fix(actions: Vec<CodeAction>) -> Option<CodeAction> {
 }
 
 fn is_import_quick_fix(action: &CodeAction) -> bool {
-    if let LspAction::Action(action) = &action.lsp_action
-        && action.disabled.is_some()
-    {
+    let disabled = matches!(&action.lsp_action, LspAction::Action(action) if action.disabled.is_some());
+    is_import_code_action(
+        action.lsp_action.action_kind().as_ref(),
+        action.lsp_action.title(),
+        disabled,
+    )
+}
+
+fn is_import_code_action(
+    kind: Option<&lsp::CodeActionKind>,
+    title: &str,
+    disabled: bool,
+) -> bool {
+    if disabled {
         return false;
     }
 
-    if action.lsp_action.action_kind().is_some_and(|kind| {
-        !code_action_kind_matches(&lsp::CodeActionKind::QUICKFIX, &kind)
-    })
-    {
+    let is_supported_kind = kind.map_or(true, |kind| {
+        code_action_kind_matches(&lsp::CodeActionKind::QUICKFIX, kind)
+            || code_action_kind_matches(&lsp::CodeActionKind::SOURCE, kind)
+    });
+    if !is_supported_kind {
         return false;
     }
 
-    let title = action.lsp_action.title().to_ascii_lowercase();
-    title.contains("import")
+    let kind = kind.map(|kind| kind.as_str().to_ascii_lowercase());
+    let title = title.to_ascii_lowercase();
+    let looks_like_import = title.contains("import")
+        || kind
+            .as_deref()
+            .is_some_and(|kind| kind.contains("addmissingimports"));
+
+    looks_like_import
         && !title.contains("organize imports")
+        && !title.contains("fix all")
         && !title.contains("remove")
         && !title.contains("unused")
 }
@@ -1001,7 +1023,7 @@ impl From<Point> for ExternalPosition {
 
 #[cfg(test)]
 mod tests {
-    use super::external_accept_url;
+    use super::{external_accept_url, is_import_code_action};
 
     #[test]
     fn test_external_accept_url() {
@@ -1017,5 +1039,49 @@ mod tests {
             external_accept_url("http://127.0.0.1:17878/custom/"),
             "http://127.0.0.1:17878/custom/accept"
         );
+    }
+
+    #[test]
+    fn test_import_code_action_selection() {
+        assert!(is_import_code_action(
+            Some(&lsp::CodeActionKind::QUICKFIX),
+            "Add import from \"shared-utils\"",
+            false,
+        ));
+        assert!(is_import_code_action(
+            Some(&lsp::CodeActionKind::new("source.addMissingImports.ts")),
+            "Add all missing imports",
+            false,
+        ));
+        assert!(is_import_code_action(
+            Some(&lsp::CodeActionKind::new("source.addMissingImports.ts")),
+            "Apply source action",
+            false,
+        ));
+        assert!(!is_import_code_action(
+            Some(&lsp::CodeActionKind::SOURCE_ORGANIZE_IMPORTS),
+            "Organize Imports",
+            false,
+        ));
+        assert!(!is_import_code_action(
+            Some(&lsp::CodeActionKind::SOURCE_FIX_ALL),
+            "Fix all auto-fixable problems",
+            false,
+        ));
+        assert!(!is_import_code_action(
+            Some(&lsp::CodeActionKind::QUICKFIX),
+            "Remove unused import",
+            false,
+        ));
+        assert!(!is_import_code_action(
+            Some(&lsp::CodeActionKind::REFACTOR),
+            "Add import",
+            false,
+        ));
+        assert!(!is_import_code_action(
+            Some(&lsp::CodeActionKind::QUICKFIX),
+            "Add import",
+            true,
+        ));
     }
 }
