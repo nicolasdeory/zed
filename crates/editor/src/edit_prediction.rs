@@ -342,6 +342,7 @@ impl Editor {
         match &active_edit_prediction.completion {
             EditPrediction::MoveWithin { target, .. } => {
                 let target = *target;
+                let mut accepted = false;
 
                 if matches!(granularity, EditPredictionGranularity::Full) {
                     if let Some(position_map) = &self.last_position_map {
@@ -361,6 +362,7 @@ impl Editor {
                             self.clear_row_highlights::<EditPredictionPreview>();
                             self.edit_prediction_preview
                                 .set_previous_scroll_position(None);
+                            accepted = true;
                         } else {
                             // Highlight and request scroll
                             self.edit_prediction_preview
@@ -388,6 +390,16 @@ impl Editor {
                             selections.select_anchor_ranges([target..target]);
                         },
                     );
+                    accepted = true;
+                }
+
+                if accepted {
+                    if let Some(provider) = self.edit_prediction_provider() {
+                        provider.accept(cx);
+                    }
+                    self.active_edit_prediction = None;
+                    self.stale_edit_prediction_in_menu = None;
+                    cx.notify();
                 }
             }
             EditPrediction::MoveOutside { snapshot, target } => {
@@ -1638,6 +1650,7 @@ impl Editor {
                 editor
                     .update_in(cx, |editor, window, cx| {
                         editor.go_to_singleton_buffer_point(target, window, cx);
+                        editor.refresh_edit_prediction(false, true, window, cx);
                     })
                     .ok();
                 anyhow::Ok(())

@@ -333,6 +333,13 @@ async fn test_edit_prediction_jump_button(cx: &mut gpui::TestAppContext) {
 
     // When accepting, cursor is moved to the proposed location
     accept_completion(&mut cx);
+    cx.update(|_, cx| {
+        assert_eq!(
+            provider.read(cx).accept_count.load(atomic::Ordering::SeqCst),
+            1,
+            "accepting a same-file jump should notify the provider"
+        );
+    });
     cx.assert_editor_state(indoc! {"
         line 0
         line 1
@@ -363,6 +370,13 @@ async fn test_edit_prediction_jump_button(cx: &mut gpui::TestAppContext) {
 
     // When accepting, cursor is moved to the proposed location
     accept_completion(&mut cx);
+    cx.update(|_, cx| {
+        assert_eq!(
+            provider.read(cx).accept_count.load(atomic::Ordering::SeqCst),
+            2,
+            "each accepted same-file jump should notify the provider"
+        );
+    });
     cx.assert_editor_state(indoc! {"
         line 0
         linˇe
@@ -1713,6 +1727,7 @@ impl CompletionProvider for FakeCompletionMenuProvider {
 pub struct FakeEditPredictionDelegate {
     pub completion: Option<edit_prediction_types::EditPrediction>,
     pub refresh_count: Arc<AtomicUsize>,
+    pub accept_count: Arc<AtomicUsize>,
 }
 
 impl FakeEditPredictionDelegate {
@@ -1768,7 +1783,9 @@ impl EditPredictionDelegate for FakeEditPredictionDelegate {
         self.refresh_count.fetch_add(1, atomic::Ordering::SeqCst);
     }
 
-    fn accept(&mut self, _cx: &mut gpui::Context<Self>) {}
+    fn accept(&mut self, _cx: &mut gpui::Context<Self>) {
+        self.accept_count.fetch_add(1, atomic::Ordering::SeqCst);
+    }
 
     fn discard(
         &mut self,

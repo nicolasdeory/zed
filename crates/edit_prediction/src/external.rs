@@ -198,14 +198,14 @@ impl EditPredictionDelegate for ExternalEditPredictionDelegate {
     }
 
     fn accept(&mut self, cx: &mut Context<Self>) {
-        if let Some(CurrentExternalPrediction::Local { buffer, edits, .. }) =
-            self.current_prediction.take()
-        {
-            let project = self.project.clone();
-            cx.spawn(async move |_, cx| {
-                apply_import_quick_fix_after_accept(project, buffer, edits, cx).await
-            })
-            .detach_and_log_err(cx);
+        if let Some(prediction) = self.current_prediction.take() {
+            if let CurrentExternalPrediction::Local { buffer, edits, .. } = prediction {
+                let project = self.project.clone();
+                cx.spawn(async move |_, cx| {
+                    apply_import_quick_fix_after_accept(project, buffer, edits, cx).await
+                })
+                .detach_and_log_err(cx);
+            }
         }
         self.pending_request = None;
     }
