@@ -199,6 +199,23 @@ impl EditPredictionDelegate for ExternalEditPredictionDelegate {
 
     fn accept(&mut self, cx: &mut Context<Self>) {
         if let Some(prediction) = self.current_prediction.take() {
+            let prediction_id = match &prediction {
+                CurrentExternalPrediction::Local { id, .. } => id.clone(),
+                CurrentExternalPrediction::Jump { id, .. } => id.clone(),
+            };
+            if let Some(prediction_id) = prediction_id {
+                let api_url = language::language_settings::all_language_settings(None, cx)
+                    .edit_predictions
+                    .external
+                    .api_url
+                    .to_string();
+                let http_client = self.http_client.clone();
+                cx.spawn(async move |_, _cx| {
+                    send_accept_request(http_client, api_url, prediction_id.to_string()).await
+                })
+                .detach_and_log_err(cx);
+            }
+
             if let CurrentExternalPrediction::Local { buffer, edits, .. } = prediction {
                 let project = self.project.clone();
                 cx.spawn(async move |_, cx| {
@@ -744,6 +761,39 @@ async fn apply_import_quick_fix_after_accept(
     Ok(())
 }
 
+async fn send_accept_request(
+    http_client: Arc<dyn HttpClient>,
+    api_url: String,
+    id: String,
+) -> Result<()> {
+    let request_body = serde_json::to_string(&ExternalAcceptRequest { id })?;
+    let http_request = http_client::Request::builder()
+        .method(http_client::Method::POST)
+        .uri(external_accept_url(&api_url))
+        .header("Content-Type", "application/json")
+        .body(AsyncBody::from(request_body))?;
+
+    let mut response = http_client
+        .send(http_request)
+        .await
+        .context("failed to send external edit prediction accept request")?;
+    let status = response.status();
+    if !status.is_success() {
+        let mut body = String::new();
+        response.body_mut().read_to_string(&mut body).await?;
+        anyhow::bail!("external edit prediction accept server error: {status} - {body}");
+    }
+
+    Ok(())
+}
+
+fn external_accept_url(api_url: &str) -> String {
+    api_url
+        .strip_suffix("/predict")
+        .map(|base| format!("{base}/accept"))
+        .unwrap_or_else(|| format!("{}/accept", api_url.trim_end_matches('/')))
+}
+
 fn accepted_edit_search_range(
     snapshot: &BufferSnapshot,
     edits: &[(Range<Anchor>, Arc<str>)],
@@ -905,6 +955,11 @@ struct ExternalEditPredictionResponse {
     jump: Option<ExternalJump>,
 }
 
+#[derive(Serialize)]
+struct ExternalAcceptRequest {
+    id: String,
+}
+
 #[derive(Deserialize)]
 struct ExternalEdit {
     #[serde(default)]
@@ -941,5 +996,26 @@ impl From<Point> for ExternalPosition {
             line: point.row,
             column: point.column,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::external_accept_url;
+
+    #[test]
+    fn test_external_accept_url() {
+        assert_eq!(
+            external_accept_url("http://127.0.0.1:17878/predict"),
+            "http://127.0.0.1:17878/accept"
+        );
+        assert_eq!(
+            external_accept_url("http://127.0.0.1:17878/custom"),
+            "http://127.0.0.1:17878/custom/accept"
+        );
+        assert_eq!(
+            external_accept_url("http://127.0.0.1:17878/custom/"),
+            "http://127.0.0.1:17878/custom/accept"
+        );
     }
 }
