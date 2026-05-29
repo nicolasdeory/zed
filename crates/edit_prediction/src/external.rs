@@ -824,6 +824,7 @@ fn accepted_edit_search_range(
     start..end
 }
 
+#[cfg(test)]
 fn select_import_quick_fix(actions: Vec<CodeAction>) -> Option<CodeAction> {
     select_import_quick_fix_from_attempts([actions]).map(|(_, action)| action)
 }
@@ -832,6 +833,7 @@ fn select_import_quick_fix_attempt(actions: Vec<CodeAction>) -> Option<CodeActio
     actions.into_iter().find(is_import_quick_fix)
 }
 
+#[cfg(test)]
 fn select_import_quick_fix_from_attempts(
     attempts: impl IntoIterator<Item = Vec<CodeAction>>,
 ) -> Option<(usize, CodeAction)> {
