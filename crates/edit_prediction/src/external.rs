@@ -227,7 +227,28 @@ impl EditPredictionDelegate for ExternalEditPredictionDelegate {
         self.pending_request = None;
     }
 
-    fn discard(&mut self, _reason: EditPredictionDiscardReason, _cx: &mut Context<Self>) {
+    fn discard(&mut self, _reason: EditPredictionDiscardReason, cx: &mut Context<Self>) {
+        let prediction_id =
+            self.current_prediction
+                .as_ref()
+                .and_then(|prediction| match prediction {
+                    CurrentExternalPrediction::Local { id, .. }
+                    | CurrentExternalPrediction::Jump { id, .. } => id.clone(),
+                });
+
+        if let Some(prediction_id) = prediction_id {
+            let api_url = language::language_settings::all_language_settings(None, cx)
+                .edit_predictions
+                .external
+                .api_url
+                .to_string();
+            let http_client = self.http_client.clone();
+            cx.spawn(async move |_, _cx| {
+                send_reject_request(http_client, api_url, prediction_id.to_string()).await
+            })
+            .detach_and_log_err(cx);
+        }
+
         self.current_prediction = None;
         self.pending_request = None;
     }
@@ -770,10 +791,27 @@ async fn send_accept_request(
     api_url: String,
     id: String,
 ) -> Result<()> {
+    send_fate_request(http_client, api_url, "accept", id).await
+}
+
+async fn send_reject_request(
+    http_client: Arc<dyn HttpClient>,
+    api_url: String,
+    id: String,
+) -> Result<()> {
+    send_fate_request(http_client, api_url, "reject", id).await
+}
+
+async fn send_fate_request(
+    http_client: Arc<dyn HttpClient>,
+    api_url: String,
+    endpoint: &str,
+    id: String,
+) -> Result<()> {
     let request_body = serde_json::to_string(&ExternalAcceptRequest { id })?;
     let http_request = http_client::Request::builder()
         .method(http_client::Method::POST)
-        .uri(external_accept_url(&api_url))
+        .uri(external_fate_url(&api_url, endpoint))
         .header("Content-Type", "application/json")
         .body(AsyncBody::from(request_body))?;
 
@@ -785,17 +823,25 @@ async fn send_accept_request(
     if !status.is_success() {
         let mut body = String::new();
         response.body_mut().read_to_string(&mut body).await?;
-        anyhow::bail!("external edit prediction accept server error: {status} - {body}");
+        anyhow::bail!("external edit prediction {endpoint} server error: {status} - {body}");
     }
 
     Ok(())
 }
 
 fn external_accept_url(api_url: &str) -> String {
+    external_fate_url(api_url, "accept")
+}
+
+fn external_reject_url(api_url: &str) -> String {
+    external_fate_url(api_url, "reject")
+}
+
+fn external_fate_url(api_url: &str, endpoint: &str) -> String {
     api_url
         .strip_suffix("/predict")
-        .map(|base| format!("{base}/accept"))
-        .unwrap_or_else(|| format!("{}/accept", api_url.trim_end_matches('/')))
+        .map(|base| format!("{base}/{endpoint}"))
+        .unwrap_or_else(|| format!("{}/{endpoint}", api_url.trim_end_matches('/')))
 }
 
 fn accepted_edit_search_range(
@@ -1042,8 +1088,9 @@ impl From<Point> for ExternalPosition {
 #[cfg(test)]
 mod tests {
     use super::{
-        accepted_edit_search_range, external_accept_url, import_quick_fix_code_action_kinds,
-        is_import_code_action, select_import_quick_fix, select_import_quick_fix_from_attempts,
+        accepted_edit_search_range, external_accept_url, external_reject_url,
+        import_quick_fix_code_action_kinds, is_import_code_action, select_import_quick_fix,
+        select_import_quick_fix_from_attempts,
     };
     use db::AppDatabase;
     use gpui::{AppContext as _, TestAppContext};
@@ -1074,6 +1121,22 @@ mod tests {
         assert_eq!(
             external_accept_url("http://127.0.0.1:17878/custom/"),
             "http://127.0.0.1:17878/custom/accept"
+        );
+    }
+
+    #[test]
+    fn test_external_reject_url() {
+        assert_eq!(
+            external_reject_url("http://127.0.0.1:17878/predict"),
+            "http://127.0.0.1:17878/reject"
+        );
+        assert_eq!(
+            external_reject_url("http://127.0.0.1:17878/custom"),
+            "http://127.0.0.1:17878/custom/reject"
+        );
+        assert_eq!(
+            external_reject_url("http://127.0.0.1:17878/custom/"),
+            "http://127.0.0.1:17878/custom/reject"
         );
     }
 
