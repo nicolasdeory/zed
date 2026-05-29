@@ -444,6 +444,7 @@ fn build_cursor_request(
         contents,
         &prompt_input.active_buffer_diagnostics,
     );
+    let diagnostics = cursor_diagnostics(&prompt_input.active_buffer_diagnostics);
 
     Some(json!({
         "currentFile": {
@@ -455,7 +456,7 @@ fn build_cursor_request(
             },
             "dataframes": [],
             "languageId": language_id,
-            "diagnostics": [],
+            "diagnostics": diagnostics,
             "totalNumberOfLines": line_count,
             "contentsStartAtLine": 0,
             "topChunks": [],
@@ -693,6 +694,40 @@ fn cursor_linter_errors(
         "relativeWorkspacePath": relative_path,
         "errors": errors,
         "fileContents": contents,
+    })
+}
+
+fn cursor_diagnostics(diagnostics: &[zeta_prompt::ActiveBufferDiagnostic]) -> Value {
+    let diagnostics = diagnostics
+        .iter()
+        .map(|diagnostic| {
+            json!({
+                "message": diagnostic.message,
+                "range": cursor_diagnostic_range(diagnostic),
+                "severity": diagnostic.severity.unwrap_or_default(),
+                "relatedInformation": [],
+            })
+        })
+        .collect::<Vec<_>>();
+
+    json!(diagnostics)
+}
+
+fn cursor_diagnostic_range(diagnostic: &zeta_prompt::ActiveBufferDiagnostic) -> Value {
+    let start = position_in_text(
+        &diagnostic.snippet,
+        diagnostic.diagnostic_range_in_snippet.start,
+    );
+    let end = position_in_text(
+        &diagnostic.snippet,
+        diagnostic.diagnostic_range_in_snippet.end,
+    );
+
+    json!({
+        "startLine": diagnostic.snippet_buffer_row_range.start + start.row,
+        "startColumn": start.column,
+        "endLine": diagnostic.snippet_buffer_row_range.start + end.row,
+        "endColumn": end.column,
     })
 }
 
@@ -1126,15 +1161,16 @@ impl From<Point> for ExternalPosition {
 #[cfg(test)]
 mod tests {
     use super::{
-        accepted_edit_search_range, external_accept_url, external_partial_accept_url,
-        external_reject_url, import_quick_fix_code_action_kinds, is_import_code_action,
-        select_import_quick_fix, select_import_quick_fix_from_attempts,
+        accepted_edit_search_range, cursor_diagnostics, cursor_linter_errors, external_accept_url,
+        external_partial_accept_url, external_reject_url, import_quick_fix_code_action_kinds,
+        is_import_code_action, select_import_quick_fix, select_import_quick_fix_from_attempts,
     };
     use db::AppDatabase;
     use gpui::{AppContext as _, TestAppContext};
     use language::Buffer;
     use lsp::LanguageServerId;
     use project::{CodeAction, LspAction};
+    use serde_json::json;
     use settings::SettingsStore;
     use std::sync::Arc;
 
@@ -1191,6 +1227,59 @@ mod tests {
         assert_eq!(
             external_partial_accept_url("http://127.0.0.1:17878/custom/"),
             "http://127.0.0.1:17878/custom/partial_accept"
+        );
+    }
+
+    #[test]
+    fn test_cursor_diagnostics_match_cursor_proto_shape() {
+        let diagnostics = vec![zeta_prompt::ActiveBufferDiagnostic {
+            severity: Some(1),
+            message: "Cannot find name `nullthrows`.".to_string(),
+            snippet: "const value = nullthrows(foo);\n".to_string(),
+            snippet_buffer_row_range: 10..11,
+            diagnostic_range_in_snippet: 14..24,
+        }];
+
+        assert_eq!(
+            cursor_diagnostics(&diagnostics),
+            json!([
+                {
+                    "message": "Cannot find name `nullthrows`.",
+                    "range": {
+                        "startLine": 10,
+                        "startColumn": 14,
+                        "endLine": 10,
+                        "endColumn": 24,
+                    },
+                    "severity": 1,
+                    "relatedInformation": [],
+                }
+            ])
+        );
+        assert_eq!(
+            cursor_linter_errors(
+                "src/file.ts",
+                "const value = nullthrows(foo);\n",
+                &diagnostics
+            ),
+            json!({
+                "relativeWorkspacePath": "src/file.ts",
+                "errors": [
+                    {
+                        "message": "Cannot find name `nullthrows`.",
+                        "range": {
+                            "startLine": 10,
+                            "startColumn": 14,
+                            "endLine": 10,
+                            "endColumn": 24,
+                        },
+                        "relatedInformation": [],
+                        "severity": 1,
+                        "isStale": false,
+                    }
+                ],
+                "fileContents": "const value = nullthrows(foo);\n",
+            })
         );
     }
 
