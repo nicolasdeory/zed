@@ -725,9 +725,7 @@ async fn apply_import_quick_fix_after_accept(
     edits: Arc<[(Range<Anchor>, Arc<str>)]>,
     cx: &mut AsyncApp,
 ) -> Result<()> {
-    const RETRY_DELAYS_MS: [u64; 4] = [100, 250, 500, 900];
-
-    for delay_ms in RETRY_DELAYS_MS {
+    for delay_ms in IMPORT_QUICK_FIX_RETRY_DELAYS_MS {
         cx.background_executor()
             .timer(std::time::Duration::from_millis(delay_ms))
             .await;
@@ -739,17 +737,14 @@ async fn apply_import_quick_fix_after_accept(
                 project.code_actions(
                     &buffer,
                     range,
-                    Some(vec![
-                        lsp::CodeActionKind::QUICKFIX,
-                        lsp::CodeActionKind::SOURCE,
-                    ]),
+                    Some(import_quick_fix_code_action_kinds()),
                     cx,
                 )
             })
             .await?
             .unwrap_or_default();
 
-        let Some(action) = select_import_quick_fix(actions) else {
+        let Some(action) = select_import_quick_fix_attempt(actions) else {
             continue;
         };
 
@@ -762,6 +757,12 @@ async fn apply_import_quick_fix_after_accept(
     }
 
     Ok(())
+}
+
+const IMPORT_QUICK_FIX_RETRY_DELAYS_MS: [u64; 4] = [100, 250, 500, 900];
+
+fn import_quick_fix_code_action_kinds() -> Vec<lsp::CodeActionKind> {
+    vec![lsp::CodeActionKind::QUICKFIX, lsp::CodeActionKind::SOURCE]
 }
 
 async fn send_accept_request(
@@ -824,7 +825,22 @@ fn accepted_edit_search_range(
 }
 
 fn select_import_quick_fix(actions: Vec<CodeAction>) -> Option<CodeAction> {
+    select_import_quick_fix_from_attempts([actions]).map(|(_, action)| action)
+}
+
+fn select_import_quick_fix_attempt(actions: Vec<CodeAction>) -> Option<CodeAction> {
     actions.into_iter().find(is_import_quick_fix)
+}
+
+fn select_import_quick_fix_from_attempts(
+    attempts: impl IntoIterator<Item = Vec<CodeAction>>,
+) -> Option<(usize, CodeAction)> {
+    attempts
+        .into_iter()
+        .enumerate()
+        .find_map(|(attempt, actions)| {
+            select_import_quick_fix_attempt(actions).map(|action| (attempt, action))
+        })
 }
 
 fn is_import_quick_fix(action: &CodeAction) -> bool {
@@ -1024,8 +1040,8 @@ impl From<Point> for ExternalPosition {
 #[cfg(test)]
 mod tests {
     use super::{
-        accepted_edit_search_range, external_accept_url, is_import_code_action,
-        select_import_quick_fix,
+        accepted_edit_search_range, external_accept_url, import_quick_fix_code_action_kinds,
+        is_import_code_action, select_import_quick_fix, select_import_quick_fix_from_attempts,
     };
     use db::AppDatabase;
     use gpui::{AppContext as _, TestAppContext};
@@ -1103,10 +1119,9 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn test_select_import_quick_fix_skips_source_actions_that_are_not_imports() {
+    fn test_code_action(title: &str, kind: lsp::CodeActionKind) -> CodeAction {
         let buffer_id = text::BufferId::new(1).unwrap();
-        let action = |title: &str, kind: lsp::CodeActionKind| CodeAction {
+        CodeAction {
             server_id: LanguageServerId(0),
             range: language::Anchor::min_for_buffer(buffer_id)
                 ..language::Anchor::min_for_buffer(buffer_id),
@@ -1116,18 +1131,33 @@ mod tests {
                 ..Default::default()
             })),
             resolved: true,
-        };
+        }
+    }
 
+    #[test]
+    fn test_import_quick_fix_requests_quickfix_and_source_actions() {
+        let kinds = import_quick_fix_code_action_kinds();
+        assert_eq!(
+            kinds.iter().map(|kind| kind.as_str()).collect::<Vec<_>>(),
+            vec![
+                lsp::CodeActionKind::QUICKFIX.as_str(),
+                lsp::CodeActionKind::SOURCE.as_str()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_select_import_quick_fix_skips_source_actions_that_are_not_imports() {
         let selected = select_import_quick_fix(vec![
-            action(
+            test_code_action(
                 "Organize Imports",
                 lsp::CodeActionKind::SOURCE_ORGANIZE_IMPORTS,
             ),
-            action(
+            test_code_action(
                 "Fix all auto-fixable problems",
                 lsp::CodeActionKind::SOURCE_FIX_ALL,
             ),
-            action(
+            test_code_action(
                 "Add import from \"shared-utils\"",
                 lsp::CodeActionKind::QUICKFIX,
             ),
@@ -1136,6 +1166,34 @@ mod tests {
 
         assert_eq!(
             selected.lsp_action.title(),
+            "Add import from \"shared-utils\""
+        );
+    }
+
+    #[test]
+    fn test_import_quick_fix_retry_selects_first_import_after_lsp_settles() {
+        let selected = select_import_quick_fix_from_attempts([
+            vec![],
+            vec![
+                test_code_action(
+                    "Organize Imports",
+                    lsp::CodeActionKind::SOURCE_ORGANIZE_IMPORTS,
+                ),
+                test_code_action(
+                    "Fix all auto-fixable problems",
+                    lsp::CodeActionKind::SOURCE_FIX_ALL,
+                ),
+            ],
+            vec![test_code_action(
+                "Add import from \"shared-utils\"",
+                lsp::CodeActionKind::QUICKFIX,
+            )],
+        ])
+        .expect("should select the import action from the first settled attempt");
+
+        assert_eq!(selected.0, 2);
+        assert_eq!(
+            selected.1.lsp_action.title(),
             "Add import from \"shared-utils\""
         );
     }
