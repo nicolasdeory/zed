@@ -4,14 +4,14 @@ use edit_prediction_types::{
     EditPrediction, EditPredictionDelegate, EditPredictionDiscardReason, EditPredictionIconSet,
     interpolate_edits,
 };
-use futures::AsyncReadExt as _;
+use futures::{AsyncReadExt as _, FutureExt as _, select_biased};
 use gpui::{
     App, AsyncApp, Context, Entity, Task, TaskExt as _,
     http_client::{self, AsyncBody, HttpClient},
 };
 use icons::IconName;
 use language::{Anchor, Buffer, BufferSnapshot, EditPreview, Point, ToOffset as _, ToPoint as _};
-use project::{CodeAction, LspAction, Project};
+use project::{CodeAction, Completion, LspAction, Project};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -19,8 +19,12 @@ use std::{
     ops::Range,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 use text::Bias;
+
+const LSP_SUGGESTED_ITEMS_TIMEOUT: Duration = Duration::from_millis(120);
+const MAX_LSP_SUGGESTED_ITEMS: usize = 40;
 
 #[derive(Clone)]
 enum CurrentExternalPrediction {
@@ -134,12 +138,15 @@ impl EditPredictionDelegate for ExternalEditPredictionDelegate {
                     .await;
             }
 
+            let lsp_suggested_labels =
+                lsp_suggested_labels(project.clone(), buffer.clone(), cursor_position, cx).await;
             let request = cx.update(|cx| {
                 build_request(
                     &project,
                     &edit_prediction_store,
                     &snapshot,
                     cursor_position,
+                    &lsp_suggested_labels,
                     cx,
                 )
             })?;
@@ -320,6 +327,7 @@ fn build_request(
     edit_prediction_store: &Entity<EditPredictionStore>,
     snapshot: &BufferSnapshot,
     cursor_position: Anchor,
+    lsp_suggested_labels: &[String],
     cx: &mut App,
 ) -> Result<ExternalEditPredictionRequest> {
     let file = snapshot.file();
@@ -359,6 +367,7 @@ fn build_request(
         &contents,
         cursor,
         cursor_position,
+        lsp_suggested_labels,
         cx,
     );
 
@@ -385,6 +394,7 @@ fn build_cursor_request(
     contents: &str,
     cursor: Point,
     cursor_position: Anchor,
+    lsp_suggested_labels: &[String],
     cx: &mut App,
 ) -> Option<Value> {
     let relative_path = relative_cursor_path(path, absolute_path, workspace_root);
@@ -445,6 +455,7 @@ fn build_cursor_request(
         &prompt_input.active_buffer_diagnostics,
     );
     let diagnostics = cursor_diagnostics(&prompt_input.active_buffer_diagnostics);
+    let lsp_suggested_items = cursor_lsp_suggested_items(lsp_suggested_labels);
 
     Some(json!({
         "currentFile": {
@@ -484,7 +495,7 @@ fn build_cursor_request(
         "timeSinceRequestStart": 0,
         "timeAtRequestSend": 0,
         "clientTimezoneOffset": 0,
-        "lspSuggestedItems": { "suggestions": [] },
+        "lspSuggestedItems": lsp_suggested_items,
         "supportsCpt": false,
         "supportsCrlfCpt": false,
         "codeResults": code_results,
@@ -694,6 +705,75 @@ fn cursor_linter_errors(
         "relativeWorkspacePath": relative_path,
         "errors": errors,
         "fileContents": contents,
+    })
+}
+
+async fn lsp_suggested_labels(
+    project: Entity<Project>,
+    buffer: Entity<Buffer>,
+    cursor_position: Anchor,
+    cx: &mut AsyncApp,
+) -> Vec<String> {
+    let completions_task = cx.update(|cx| {
+        project.update(cx, |project, cx| {
+            project.completions(
+                &buffer,
+                cursor_position,
+                lsp::CompletionContext {
+                    trigger_kind: lsp::CompletionTriggerKind::INVOKED,
+                    trigger_character: None,
+                },
+                cx,
+            )
+        })
+    });
+
+    let timeout = cx
+        .background_executor()
+        .timer(LSP_SUGGESTED_ITEMS_TIMEOUT)
+        .fuse();
+    let completions = completions_task.fuse();
+    futures::pin_mut!(completions, timeout);
+
+    let responses = select_biased! {
+        response = completions => response.unwrap_or_else(|err| {
+            log::debug!("failed to fetch LSP suggestions for Cursor payload: {err:#}");
+            Vec::new()
+        }),
+        () = timeout => Vec::new(),
+    };
+
+    let mut seen = HashSet::new();
+    responses
+        .into_iter()
+        .flat_map(|response| response.completions)
+        .filter_map(|completion| cursor_lsp_suggestion_label(&completion))
+        .filter(|label| seen.insert(label.clone()))
+        .take(MAX_LSP_SUGGESTED_ITEMS)
+        .collect()
+}
+
+fn cursor_lsp_suggestion_label(completion: &Completion) -> Option<String> {
+    completion
+        .source
+        .lsp_completion(false)
+        .map(|completion| completion.label.trim().to_string())
+        .or_else(|| {
+            let label = completion.label.text.trim();
+            (!label.is_empty()).then(|| label.to_string())
+        })
+        .filter(|label| !label.is_empty())
+}
+
+fn cursor_lsp_suggested_items(labels: &[String]) -> Value {
+    json!({
+        "suggestions": labels
+            .iter()
+            .filter_map(|label| {
+                let label = label.trim();
+                (!label.is_empty()).then(|| json!({ "label": label }))
+            })
+            .collect::<Vec<_>>()
     })
 }
 
@@ -1161,9 +1241,10 @@ impl From<Point> for ExternalPosition {
 #[cfg(test)]
 mod tests {
     use super::{
-        accepted_edit_search_range, cursor_diagnostics, cursor_linter_errors, external_accept_url,
-        external_partial_accept_url, external_reject_url, import_quick_fix_code_action_kinds,
-        is_import_code_action, select_import_quick_fix, select_import_quick_fix_from_attempts,
+        accepted_edit_search_range, cursor_diagnostics, cursor_linter_errors,
+        cursor_lsp_suggested_items, external_accept_url, external_partial_accept_url,
+        external_reject_url, import_quick_fix_code_action_kinds, is_import_code_action,
+        select_import_quick_fix, select_import_quick_fix_from_attempts,
     };
     use db::AppDatabase;
     use gpui::{AppContext as _, TestAppContext};
@@ -1279,6 +1360,23 @@ mod tests {
                     }
                 ],
                 "fileContents": "const value = nullthrows(foo);\n",
+            })
+        );
+    }
+
+    #[test]
+    fn test_cursor_lsp_suggested_items_match_cursor_proto_shape() {
+        assert_eq!(
+            cursor_lsp_suggested_items(&[
+                "nullthrows".to_string(),
+                " ".to_string(),
+                "useMemo".to_string()
+            ]),
+            json!({
+                "suggestions": [
+                    { "label": "nullthrows" },
+                    { "label": "useMemo" },
+                ]
             })
         );
     }
