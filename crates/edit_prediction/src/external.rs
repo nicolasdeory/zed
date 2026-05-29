@@ -828,7 +828,8 @@ fn select_import_quick_fix(actions: Vec<CodeAction>) -> Option<CodeAction> {
 }
 
 fn is_import_quick_fix(action: &CodeAction) -> bool {
-    let disabled = matches!(&action.lsp_action, LspAction::Action(action) if action.disabled.is_some());
+    let disabled =
+        matches!(&action.lsp_action, LspAction::Action(action) if action.disabled.is_some());
     is_import_code_action(
         action.lsp_action.action_kind().as_ref(),
         action.lsp_action.title(),
@@ -836,11 +837,7 @@ fn is_import_quick_fix(action: &CodeAction) -> bool {
     )
 }
 
-fn is_import_code_action(
-    kind: Option<&lsp::CodeActionKind>,
-    title: &str,
-    disabled: bool,
-) -> bool {
+fn is_import_code_action(kind: Option<&lsp::CodeActionKind>, title: &str, disabled: bool) -> bool {
     if disabled {
         return false;
     }
@@ -943,7 +940,10 @@ fn point_for_jump(snapshot: &BufferSnapshot, jump: &ExternalJump) -> Point {
                 return Point::new(row, column as u32);
             }
             if line.trim() == expected_content {
-                return Point::new(row, line.len().saturating_sub(line.trim_start().len()) as u32);
+                return Point::new(
+                    row,
+                    line.len().saturating_sub(line.trim_start().len()) as u32,
+                );
             }
         }
     }
@@ -1023,7 +1023,25 @@ impl From<Point> for ExternalPosition {
 
 #[cfg(test)]
 mod tests {
-    use super::{external_accept_url, is_import_code_action};
+    use super::{
+        accepted_edit_search_range, external_accept_url, is_import_code_action,
+        select_import_quick_fix,
+    };
+    use db::AppDatabase;
+    use gpui::{AppContext as _, TestAppContext};
+    use language::Buffer;
+    use lsp::LanguageServerId;
+    use project::{CodeAction, LspAction};
+    use settings::SettingsStore;
+    use std::sync::Arc;
+
+    fn init_test(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            cx.set_global(AppDatabase::test_new());
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+        });
+    }
 
     #[test]
     fn test_external_accept_url() {
@@ -1083,5 +1101,69 @@ mod tests {
             "Add import",
             true,
         ));
+    }
+
+    #[test]
+    fn test_select_import_quick_fix_skips_source_actions_that_are_not_imports() {
+        let buffer_id = text::BufferId::new(1).unwrap();
+        let action = |title: &str, kind: lsp::CodeActionKind| CodeAction {
+            server_id: LanguageServerId(0),
+            range: language::Anchor::min_for_buffer(buffer_id)
+                ..language::Anchor::min_for_buffer(buffer_id),
+            lsp_action: LspAction::Action(Box::new(lsp::CodeAction {
+                title: title.into(),
+                kind: Some(kind),
+                ..Default::default()
+            })),
+            resolved: true,
+        };
+
+        let selected = select_import_quick_fix(vec![
+            action(
+                "Organize Imports",
+                lsp::CodeActionKind::SOURCE_ORGANIZE_IMPORTS,
+            ),
+            action(
+                "Fix all auto-fixable problems",
+                lsp::CodeActionKind::SOURCE_FIX_ALL,
+            ),
+            action(
+                "Add import from \"shared-utils\"",
+                lsp::CodeActionKind::QUICKFIX,
+            ),
+        ])
+        .expect("should select the import-looking action");
+
+        assert_eq!(
+            selected.lsp_action.title(),
+            "Add import from \"shared-utils\""
+        );
+    }
+
+    #[gpui::test]
+    async fn test_accepted_edit_search_range_tracks_inserted_prediction(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let buffer = cx.new(|cx| Buffer::local("const value = \n", cx));
+        let prediction_edits = buffer.update(cx, |buffer, cx| {
+            let snapshot = buffer.snapshot();
+            let start = snapshot.anchor_before(language::Point::new(0, 14));
+            let end = snapshot.anchor_after(language::Point::new(0, 14));
+            let edits: Arc<[_]> = vec![(start..end, Arc::<str>::from("nullthrows(foo);\n"))].into();
+            assert_eq!(
+                accepted_edit_search_range(&snapshot, &edits),
+                language::Point::new(0, 0)..language::Point::new(1, 0)
+            );
+            buffer.edit(edits.iter().cloned(), None, cx);
+            edits
+        });
+
+        buffer.read_with(cx, |buffer, _| {
+            let snapshot = buffer.snapshot();
+            assert_eq!(
+                accepted_edit_search_range(&snapshot, &prediction_edits),
+                language::Point::new(0, 0)..language::Point::new(2, 0)
+            );
+        });
     }
 }
