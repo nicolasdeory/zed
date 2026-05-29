@@ -39,6 +39,7 @@ enum CurrentExternalPrediction {
         id: Option<Arc<str>>,
         snapshot: BufferSnapshot,
         target: Anchor,
+        should_retrigger: bool,
     },
 }
 
@@ -289,36 +290,45 @@ impl EditPredictionDelegate for ExternalEditPredictionDelegate {
         _cursor_position: Anchor,
         cx: &mut Context<Self>,
     ) -> Option<EditPrediction> {
-        match self.current_prediction.as_ref()? {
-            CurrentExternalPrediction::Local {
-                id,
-                buffer: _,
-                snapshot,
-                edits,
-                edit_preview,
-            } => {
-                let buffer = buffer.read(cx);
-                let edits = interpolate_edits(snapshot, &buffer.snapshot(), edits)?;
-                if edits.is_empty() {
-                    return None;
-                }
-                Some(EditPrediction::Local {
-                    id: id.as_ref().map(|id| id.to_string().into()),
-                    edits,
-                    cursor_position: None,
-                    edit_preview: Some(edit_preview.clone()),
-                })
+        let buffer_snapshot = buffer.read(cx).snapshot();
+        edit_prediction_from_current_prediction(self.current_prediction.as_ref()?, &buffer_snapshot)
+    }
+}
+
+fn edit_prediction_from_current_prediction(
+    prediction: &CurrentExternalPrediction,
+    buffer_snapshot: &BufferSnapshot,
+) -> Option<EditPrediction> {
+    match prediction {
+        CurrentExternalPrediction::Local {
+            id,
+            buffer: _,
+            snapshot,
+            edits,
+            edit_preview,
+        } => {
+            let edits = interpolate_edits(snapshot, buffer_snapshot, edits)?;
+            if edits.is_empty() {
+                return None;
             }
-            CurrentExternalPrediction::Jump {
-                id,
-                snapshot,
-                target,
-            } => Some(EditPrediction::Jump {
+            Some(EditPrediction::Local {
                 id: id.as_ref().map(|id| id.to_string().into()),
-                snapshot: snapshot.clone(),
-                target: *target,
-            }),
+                edits,
+                cursor_position: None,
+                edit_preview: Some(edit_preview.clone()),
+            })
         }
+        CurrentExternalPrediction::Jump {
+            id,
+            snapshot,
+            target,
+            should_retrigger,
+        } => Some(EditPrediction::Jump {
+            id: id.as_ref().map(|id| id.to_string().into()),
+            snapshot: snapshot.clone(),
+            target: *target,
+            should_retrigger: *should_retrigger,
+        }),
     }
 }
 
@@ -844,7 +854,7 @@ async fn prediction_from_response(
                 path: edit.path.unwrap_or_default(),
                 position: edit.range.start,
                 expected_content: None,
-                _should_retrigger: None,
+                should_retrigger: Some(true),
             };
             return jump_prediction(project, response.id.clone(), jump, cx).await;
         }
@@ -1149,6 +1159,7 @@ async fn jump_prediction(
         id: id.map(Into::into),
         snapshot,
         target,
+        should_retrigger: jump.should_retrigger.unwrap_or(false),
     }))
 }
 
@@ -1248,7 +1259,7 @@ struct ExternalJump {
     #[serde(default)]
     expected_content: Option<String>,
     #[serde(default, rename = "should_retrigger")]
-    _should_retrigger: Option<bool>,
+    should_retrigger: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -1275,10 +1286,11 @@ impl From<Point> for ExternalPosition {
 #[cfg(test)]
 mod tests {
     use super::{
-        accepted_edit_search_range, cursor_diagnostics, cursor_linter_errors,
-        cursor_lsp_suggested_items, external_accept_url, external_partial_accept_url,
-        external_reject_url, import_quick_fix_code_action_kinds, is_import_code_action,
-        select_import_quick_fix, select_import_quick_fix_from_attempts,
+        CurrentExternalPrediction, EditPrediction, accepted_edit_search_range, cursor_diagnostics,
+        cursor_linter_errors, cursor_lsp_suggested_items, edit_prediction_from_current_prediction,
+        external_accept_url, external_partial_accept_url, external_reject_url,
+        import_quick_fix_code_action_kinds, is_import_code_action, select_import_quick_fix,
+        select_import_quick_fix_from_attempts,
     };
     use db::AppDatabase;
     use gpui::{AppContext as _, TestAppContext};
@@ -1413,6 +1425,37 @@ mod tests {
                 ]
             })
         );
+    }
+
+    #[gpui::test]
+    async fn test_external_jump_preserves_should_retrigger(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let buffer = cx.new(|cx| Buffer::local("one\ntwo\n", cx));
+        let (snapshot, target) = buffer.read_with(cx, |buffer, _cx| {
+            let snapshot = buffer.snapshot();
+            let target = snapshot.anchor_before(language::Point::new(1, 0));
+            (snapshot, target)
+        });
+
+        for should_retrigger in [false, true] {
+            let prediction = CurrentExternalPrediction::Jump {
+                id: Some(Arc::from("jump-id")),
+                snapshot: snapshot.clone(),
+                target,
+                should_retrigger,
+            };
+            let edit_prediction =
+                edit_prediction_from_current_prediction(&prediction, &snapshot).unwrap();
+
+            match edit_prediction {
+                EditPrediction::Jump {
+                    should_retrigger: actual,
+                    ..
+                } => assert_eq!(actual, should_retrigger),
+                EditPrediction::Local { .. } => panic!("expected jump prediction"),
+            }
+        }
     }
 
     #[test]

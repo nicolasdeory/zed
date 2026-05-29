@@ -40,6 +40,7 @@ pub(super) enum EditPrediction {
     MoveOutside {
         target: language::Anchor,
         snapshot: BufferSnapshot,
+        should_retrigger: bool,
     },
 }
 
@@ -403,10 +404,21 @@ impl Editor {
                     cx.notify();
                 }
             }
-            EditPrediction::MoveOutside { snapshot, target } => {
+            EditPrediction::MoveOutside {
+                snapshot,
+                target,
+                should_retrigger,
+            } => {
                 if let Some(workspace) = self.workspace() {
-                    Self::open_editor_at_anchor(snapshot, *target, &workspace, window, cx)
-                        .detach_and_log_err(cx);
+                    Self::open_editor_at_anchor(
+                        snapshot,
+                        *target,
+                        *should_retrigger,
+                        &workspace,
+                        window,
+                        cx,
+                    )
+                    .detach_and_log_err(cx);
                 }
                 if let Some(provider) = self.edit_prediction_provider() {
                     provider.accept(cx);
@@ -871,6 +883,7 @@ impl Editor {
                 id,
                 snapshot,
                 target,
+                should_retrigger,
             } => {
                 if let Some(provider) = &self.edit_prediction_provider {
                     provider.provider.did_show(SuggestionDisplayType::Jump, cx);
@@ -878,7 +891,11 @@ impl Editor {
                 self.stale_edit_prediction_in_menu = None;
                 self.active_edit_prediction = Some(EditPredictionState {
                     inlay_ids: vec![],
-                    completion: EditPrediction::MoveOutside { snapshot, target },
+                    completion: EditPrediction::MoveOutside {
+                        snapshot,
+                        target,
+                        should_retrigger,
+                    },
                     completion_id: id,
                     invalidation_range: None,
                 });
@@ -1634,6 +1651,7 @@ impl Editor {
     fn open_editor_at_anchor(
         snapshot: &language::BufferSnapshot,
         target: language::Anchor,
+        should_retrigger: bool,
         workspace: &Entity<Workspace>,
         window: &mut Window,
         cx: &mut App,
@@ -1654,7 +1672,9 @@ impl Editor {
                 editor
                     .update_in(cx, |editor, window, cx| {
                         editor.go_to_singleton_buffer_point(target, window, cx);
-                        editor.refresh_edit_prediction(false, true, window, cx);
+                        if should_retrigger {
+                            editor.refresh_edit_prediction(false, true, window, cx);
+                        }
                     })
                     .ok();
                 anyhow::Ok(())

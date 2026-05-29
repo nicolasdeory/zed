@@ -206,6 +206,7 @@ impl EditPredictionDelegate for ZedEditPredictionDelegate {
                         id: Some(prediction.id.0.clone()),
                         snapshot: prediction.snapshot.clone(),
                         target: prediction.edits.first().unwrap().0.start,
+                        should_retrigger: true,
                     });
                 }
             };

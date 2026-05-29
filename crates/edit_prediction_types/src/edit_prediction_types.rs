@@ -113,6 +113,7 @@ pub enum EditPrediction {
         id: Option<SharedString>,
         snapshot: language::BufferSnapshot,
         target: language::Anchor,
+        should_retrigger: bool,
     },
 }
 
