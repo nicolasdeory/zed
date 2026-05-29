@@ -1029,7 +1029,14 @@ fn select_import_quick_fix(actions: Vec<CodeAction>) -> Option<CodeAction> {
 }
 
 fn select_import_quick_fix_attempt(actions: Vec<CodeAction>) -> Option<CodeAction> {
-    actions.into_iter().find(is_import_quick_fix)
+    actions
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, action)| {
+            import_quick_fix_priority(&action).map(|priority| (priority, index, action))
+        })
+        .min_by_key(|(priority, index, _)| (*priority, *index))
+        .map(|(_, _, action)| action)
 }
 
 #[cfg(test)]
@@ -1044,14 +1051,41 @@ fn select_import_quick_fix_from_attempts(
         })
 }
 
-fn is_import_quick_fix(action: &CodeAction) -> bool {
+fn import_quick_fix_priority(action: &CodeAction) -> Option<u8> {
     let disabled =
         matches!(&action.lsp_action, LspAction::Action(action) if action.disabled.is_some());
-    is_import_code_action(
+    if !is_import_code_action(
         action.lsp_action.action_kind().as_ref(),
         action.lsp_action.title(),
         disabled,
-    )
+    ) {
+        return None;
+    }
+
+    let kind = action
+        .lsp_action
+        .action_kind()
+        .map(|kind| kind.as_str().to_ascii_lowercase());
+    let title = action.lsp_action.title().to_ascii_lowercase();
+
+    if title.contains("add import from")
+        || title.contains("import from")
+        || (title.starts_with("import ") && title.contains(" from "))
+    {
+        Some(0)
+    } else if kind
+        .as_deref()
+        .is_some_and(|kind| kind.contains("quickfix"))
+    {
+        Some(1)
+    } else if kind
+        .as_deref()
+        .is_some_and(|kind| kind.contains("addmissingimports"))
+    {
+        Some(2)
+    } else {
+        Some(3)
+    }
 }
 
 fn is_import_code_action(kind: Option<&lsp::CodeActionKind>, title: &str, disabled: bool) -> bool {
@@ -1501,6 +1535,30 @@ mod tests {
         assert_eq!(
             selected.1.lsp_action.title(),
             "Add import from \"shared-utils\""
+        );
+    }
+
+    #[test]
+    fn test_select_import_quick_fix_prefers_specific_imports() {
+        let selected = select_import_quick_fix(vec![
+            test_code_action(
+                "Add all missing imports",
+                lsp::CodeActionKind::new("source.addMissingImports.ts"),
+            ),
+            test_code_action(
+                "Import 'nullthrows' from module \"shared-utils\"",
+                lsp::CodeActionKind::QUICKFIX,
+            ),
+            test_code_action(
+                "Add import from \"shared-utils\"",
+                lsp::CodeActionKind::QUICKFIX,
+            ),
+        ])
+        .expect("should select the most specific import quick fix");
+
+        assert_eq!(
+            selected.lsp_action.title(),
+            "Import 'nullthrows' from module \"shared-utils\""
         );
     }
 
