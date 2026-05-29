@@ -529,6 +529,9 @@ impl Editor {
                             });
 
                             self.replace_selections(&text_to_insert, None, window, cx, false);
+                            if let Some(provider) = self.edit_prediction_provider() {
+                                provider.partial_accept(cx);
+                            }
                             self.refresh_edit_prediction(true, true, window, cx);
                             cx.notify();
                         } else {

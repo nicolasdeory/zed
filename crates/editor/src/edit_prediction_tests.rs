@@ -24,9 +24,9 @@ use text::{Point, ToOffset};
 use ui::prelude::*;
 
 use crate::{
-    AcceptEditPrediction, CodeContextMenu, CompletionContext, CompletionProvider, EditPrediction,
-    EditPredictionKeybindAction, EditPredictionKeybindSurface, MenuEditPredictionsPolicy,
-    MultiBuffer, ShowCompletions,
+    AcceptEditPrediction, AcceptNextWordEditPrediction, CodeContextMenu, CompletionContext,
+    CompletionProvider, EditPrediction, EditPredictionKeybindAction, EditPredictionKeybindSurface,
+    MenuEditPredictionsPolicy, MultiBuffer, ShowCompletions,
     editor_tests::{init_test, update_test_language_settings},
     test::{
         build_editor, editor_lsp_test_context::EditorLspTestContext,
@@ -912,6 +912,51 @@ async fn test_edit_prediction_preview_supersedes_completions_menu(cx: &mut gpui:
     });
 }
 
+#[gpui::test]
+async fn test_partial_edit_prediction_accept_notifies_provider(cx: &mut gpui::TestAppContext) {
+    init_test(cx, |_| {});
+
+    let mut cx = EditorTestContext::new(cx).await;
+    let provider = cx.new(|_| FakeEditPredictionDelegate::default());
+    assign_editor_completion_provider(provider.clone(), &mut cx);
+    cx.set_state("let value = ˇ");
+
+    let snapshot = cx.buffer_snapshot();
+    let edit_position = snapshot.anchor_after(Point::new(0, 12));
+    cx.update(|_, cx| {
+        provider.update(cx, |provider, _| {
+            provider.set_edit_prediction(Some(edit_prediction_types::EditPrediction::Local {
+                id: Some("prediction-1".into()),
+                edits: vec![(edit_position..edit_position, "alpha beta".into())],
+                cursor_position: None,
+                edit_preview: None,
+            }))
+        })
+    });
+
+    cx.update_editor(|editor, window, cx| editor.update_visible_edit_prediction(window, cx));
+    cx.update_editor(|editor, window, cx| {
+        editor.accept_next_word_edit_prediction(&AcceptNextWordEditPrediction, window, cx)
+    });
+
+    cx.assert_editor_state("let value = alphaˇ");
+    cx.update(|_, cx| {
+        assert_eq!(
+            provider
+                .read(cx)
+                .partial_accept_count
+                .load(atomic::Ordering::SeqCst),
+            1,
+            "partial accepting an edit prediction should notify the provider"
+        );
+        assert_eq!(
+            provider.read(cx).accept_count.load(atomic::Ordering::SeqCst),
+            0,
+            "partial accepting should not be reported as a full accept"
+        );
+    });
+}
+
 fn load_default_keymap(cx: &mut gpui::TestAppContext) {
     cx.update(|cx| {
         cx.bind_keys(
@@ -1738,6 +1783,7 @@ pub struct FakeEditPredictionDelegate {
     pub completion: Option<edit_prediction_types::EditPrediction>,
     pub refresh_count: Arc<AtomicUsize>,
     pub accept_count: Arc<AtomicUsize>,
+    pub partial_accept_count: Arc<AtomicUsize>,
 }
 
 impl FakeEditPredictionDelegate {
@@ -1795,6 +1841,11 @@ impl EditPredictionDelegate for FakeEditPredictionDelegate {
 
     fn accept(&mut self, _cx: &mut gpui::Context<Self>) {
         self.accept_count.fetch_add(1, atomic::Ordering::SeqCst);
+    }
+
+    fn partial_accept(&mut self, _cx: &mut gpui::Context<Self>) {
+        self.partial_accept_count
+            .fetch_add(1, atomic::Ordering::SeqCst);
     }
 
     fn discard(

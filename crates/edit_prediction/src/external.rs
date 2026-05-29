@@ -227,6 +227,29 @@ impl EditPredictionDelegate for ExternalEditPredictionDelegate {
         self.pending_request = None;
     }
 
+    fn partial_accept(&mut self, cx: &mut Context<Self>) {
+        let prediction_id =
+            self.current_prediction
+                .as_ref()
+                .and_then(|prediction| match prediction {
+                    CurrentExternalPrediction::Local { id, .. }
+                    | CurrentExternalPrediction::Jump { id, .. } => id.clone(),
+                });
+
+        if let Some(prediction_id) = prediction_id {
+            let api_url = language::language_settings::all_language_settings(None, cx)
+                .edit_predictions
+                .external
+                .api_url
+                .to_string();
+            let http_client = self.http_client.clone();
+            cx.spawn(async move |_, _cx| {
+                send_partial_accept_request(http_client, api_url, prediction_id.to_string()).await
+            })
+            .detach_and_log_err(cx);
+        }
+    }
+
     fn discard(&mut self, _reason: EditPredictionDiscardReason, cx: &mut Context<Self>) {
         let prediction_id =
             self.current_prediction
@@ -802,6 +825,14 @@ async fn send_reject_request(
     send_fate_request(http_client, api_url, "reject", id).await
 }
 
+async fn send_partial_accept_request(
+    http_client: Arc<dyn HttpClient>,
+    api_url: String,
+    id: String,
+) -> Result<()> {
+    send_fate_request(http_client, api_url, "partial_accept", id).await
+}
+
 async fn send_fate_request(
     http_client: Arc<dyn HttpClient>,
     api_url: String,
@@ -837,6 +868,11 @@ fn external_accept_url(api_url: &str) -> String {
 #[cfg(test)]
 fn external_reject_url(api_url: &str) -> String {
     external_fate_url(api_url, "reject")
+}
+
+#[cfg(test)]
+fn external_partial_accept_url(api_url: &str) -> String {
+    external_fate_url(api_url, "partial_accept")
 }
 
 fn external_fate_url(api_url: &str, endpoint: &str) -> String {
@@ -1090,9 +1126,9 @@ impl From<Point> for ExternalPosition {
 #[cfg(test)]
 mod tests {
     use super::{
-        accepted_edit_search_range, external_accept_url, external_reject_url,
-        import_quick_fix_code_action_kinds, is_import_code_action, select_import_quick_fix,
-        select_import_quick_fix_from_attempts,
+        accepted_edit_search_range, external_accept_url, external_partial_accept_url,
+        external_reject_url, import_quick_fix_code_action_kinds, is_import_code_action,
+        select_import_quick_fix, select_import_quick_fix_from_attempts,
     };
     use db::AppDatabase;
     use gpui::{AppContext as _, TestAppContext};
@@ -1139,6 +1175,22 @@ mod tests {
         assert_eq!(
             external_reject_url("http://127.0.0.1:17878/custom/"),
             "http://127.0.0.1:17878/custom/reject"
+        );
+    }
+
+    #[test]
+    fn test_external_partial_accept_url() {
+        assert_eq!(
+            external_partial_accept_url("http://127.0.0.1:17878/predict"),
+            "http://127.0.0.1:17878/partial_accept"
+        );
+        assert_eq!(
+            external_partial_accept_url("http://127.0.0.1:17878/custom"),
+            "http://127.0.0.1:17878/custom/partial_accept"
+        );
+        assert_eq!(
+            external_partial_accept_url("http://127.0.0.1:17878/custom/"),
+            "http://127.0.0.1:17878/custom/partial_accept"
         );
     }
 
