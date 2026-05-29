@@ -829,10 +829,12 @@ async fn send_fate_request(
     Ok(())
 }
 
+#[cfg(test)]
 fn external_accept_url(api_url: &str) -> String {
     external_fate_url(api_url, "accept")
 }
 
+#[cfg(test)]
 fn external_reject_url(api_url: &str) -> String {
     external_fate_url(api_url, "reject")
 }
