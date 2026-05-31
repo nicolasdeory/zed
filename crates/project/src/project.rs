@@ -121,12 +121,14 @@ pub use snippet_provider;
 use snippet_provider::SnippetProvider;
 use std::{
     borrow::Cow,
+    cell::RefCell,
     collections::BTreeMap,
     ffi::OsString,
     future::Future,
     ops::{Not as _, Range},
     path::{Path, PathBuf},
     pin::pin,
+    rc::Rc,
     str::{self, FromStr},
     sync::Arc,
     time::Duration,
@@ -4407,6 +4409,18 @@ impl Project {
         let position = position.to_point_utf16(buffer.read(cx));
         self.lsp_store.update(cx, |lsp_store, cx| {
             lsp_store.completions(buffer, position, context, cx)
+        })
+    }
+
+    pub fn resolve_completions(
+        &self,
+        buffer: Entity<Buffer>,
+        completion_indices: Vec<usize>,
+        completions: Rc<RefCell<Box<[Completion]>>>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<bool>> {
+        self.lsp_store.update(cx, |lsp_store, cx| {
+            lsp_store.resolve_completions(buffer, completion_indices, completions, cx)
         })
     }
 

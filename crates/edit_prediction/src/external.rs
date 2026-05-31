@@ -15,16 +15,28 @@ use project::{CodeAction, Completion, LspAction, Project};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
+    cell::RefCell,
     collections::{HashMap, HashSet},
     ops::Range,
     path::{Path, PathBuf},
+    rc::Rc,
     sync::Arc,
     time::Duration,
 };
 use text::Bias;
 
+const EXTERNAL_REQUEST_DEBOUNCE: Duration = Duration::from_millis(70);
 const LSP_SUGGESTED_ITEMS_TIMEOUT: Duration = Duration::from_millis(120);
 const MAX_LSP_SUGGESTED_ITEMS: usize = 40;
+const MAX_LSP_SUGGESTED_ITEMS_TO_RESOLVE: usize = 0;
+const MAX_LSP_SUGGESTED_LABEL_LEN: usize = 10_000;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CursorLspSuggestion {
+    label: String,
+    source_module: Option<String>,
+    additional_text_edits: Vec<lsp::TextEdit>,
+}
 
 #[derive(Clone)]
 enum CurrentExternalPrediction {
@@ -135,12 +147,16 @@ impl EditPredictionDelegate for ExternalEditPredictionDelegate {
         self.pending_request = Some(cx.spawn(async move |this, cx| {
             if debounce {
                 cx.background_executor()
-                    .timer(std::time::Duration::from_millis(150))
+                    .timer(EXTERNAL_REQUEST_DEBOUNCE)
                     .await;
             }
 
-            let lsp_suggested_labels =
-                lsp_suggested_labels(project.clone(), buffer.clone(), cursor_position, cx).await;
+            let lsp_suggestions =
+                lsp_suggestions(project.clone(), buffer.clone(), cursor_position, cx).await;
+            let lsp_suggested_labels = lsp_suggestions
+                .iter()
+                .map(|suggestion| suggestion.label.clone())
+                .collect::<Vec<_>>();
             let request = cx.update(|cx| {
                 build_request(
                     &project,
@@ -148,6 +164,7 @@ impl EditPredictionDelegate for ExternalEditPredictionDelegate {
                     &snapshot,
                     cursor_position,
                     &lsp_suggested_labels,
+                    &lsp_suggestions,
                     cx,
                 )
             })?;
@@ -188,9 +205,16 @@ impl EditPredictionDelegate for ExternalEditPredictionDelegate {
             let response: ExternalEditPredictionResponse =
                 serde_json::from_str(&body).context("failed to parse external edit prediction")?;
 
-            let prediction =
-                prediction_from_response(&project, &buffer, &snapshot, current_path, response, cx)
-                    .await?;
+            let prediction = prediction_from_response(
+                &project,
+                &buffer,
+                &snapshot,
+                current_path,
+                response,
+                &lsp_suggestions,
+                cx,
+            )
+            .await?;
 
             this.update(cx, |this, cx| {
                 if this.next_request_id != request_id {
@@ -338,6 +362,7 @@ fn build_request(
     snapshot: &BufferSnapshot,
     cursor_position: Anchor,
     lsp_suggested_labels: &[String],
+    lsp_suggestions: &[CursorLspSuggestion],
     cx: &mut App,
 ) -> Result<ExternalEditPredictionRequest> {
     let file = snapshot.file();
@@ -378,6 +403,7 @@ fn build_request(
         cursor,
         cursor_position,
         lsp_suggested_labels,
+        lsp_suggestions,
         cx,
     );
 
@@ -405,6 +431,7 @@ fn build_cursor_request(
     cursor: Point,
     cursor_position: Anchor,
     lsp_suggested_labels: &[String],
+    lsp_suggestions: &[CursorLspSuggestion],
     cx: &mut App,
 ) -> Option<Value> {
     let relative_path = relative_cursor_path(path, absolute_path, workspace_root);
@@ -443,14 +470,14 @@ fn build_cursor_request(
         None,
     );
 
-    let file_diff_histories = cursor_file_diff_histories(&events);
+    let file_diff_histories = cursor_file_diff_histories(&events, workspace_root);
     let diff_history = file_diff_histories
         .iter()
         .find_map(|history| {
             (history["fileName"].as_str()? == relative_path).then(|| history["diffHistory"].clone())
         })
         .unwrap_or_else(|| json!([]));
-    let mut additional_files = cursor_additional_files(&related_files);
+    let mut additional_files = cursor_additional_files(&related_files, workspace_root);
     append_open_buffer_additional_files(
         &mut additional_files,
         project,
@@ -458,7 +485,7 @@ fn build_cursor_request(
         workspace_root,
         cx,
     );
-    let code_results = cursor_code_results(&related_files);
+    let code_results = cursor_code_results(&related_files, workspace_root);
     let linter_errors = cursor_linter_errors(
         &relative_path,
         contents,
@@ -466,6 +493,7 @@ fn build_cursor_request(
     );
     let diagnostics = cursor_diagnostics(&prompt_input.active_buffer_diagnostics);
     let lsp_suggested_items = cursor_lsp_suggested_items(lsp_suggested_labels);
+    let zed_external_proxy = cursor_lsp_suggestion_metadata(lsp_suggestions);
 
     Some(json!({
         "currentFile": {
@@ -510,6 +538,7 @@ fn build_cursor_request(
         "supportsCrlfCpt": false,
         "codeResults": code_results,
         "linterErrors": linter_errors,
+        "zedExternalProxy": zed_external_proxy,
     }))
 }
 
@@ -527,6 +556,28 @@ fn relative_cursor_path(
     path.to_string()
 }
 
+fn normalize_cursor_context_path(path: &Path, workspace_root: Option<&str>) -> String {
+    if let Some(workspace_root) = workspace_root
+        && let Ok(relative_path) = path.strip_prefix(workspace_root)
+    {
+        return relative_path.to_string_lossy().into_owned();
+    }
+
+    let path = path.to_string_lossy();
+    let path = path.as_ref();
+    if let Some(workspace_root) = workspace_root
+        && let Some(workspace_name) = Path::new(workspace_root).file_name()
+    {
+        let workspace_name = workspace_name.to_string_lossy();
+        let prefixed = format!("{workspace_name}/");
+        if let Some(stripped) = path.strip_prefix(&prefixed) {
+            return stripped.to_string();
+        }
+    }
+
+    path.to_string()
+}
+
 fn language_id(language: Option<&str>) -> String {
     language
         .unwrap_or("plaintext")
@@ -535,13 +586,17 @@ fn language_id(language: Option<&str>) -> String {
         .collect()
 }
 
-fn cursor_file_diff_histories(events: &[Arc<zeta_prompt::Event>]) -> Vec<Value> {
+fn cursor_file_diff_histories(
+    events: &[Arc<zeta_prompt::Event>],
+    workspace_root: Option<&str>,
+) -> Vec<Value> {
     let mut histories_by_path = HashMap::<String, Vec<String>>::new();
 
     for event in events.iter().rev().take(20).rev() {
         let zeta_prompt::Event::BufferChange { path, diff, .. } = event.as_ref();
+        let path = normalize_cursor_context_path(path, workspace_root);
         histories_by_path
-            .entry(path.to_string_lossy().into_owned())
+            .entry(path)
             .or_default()
             .push(diff.clone());
     }
@@ -559,10 +614,14 @@ fn cursor_file_diff_histories(events: &[Arc<zeta_prompt::Event>]) -> Vec<Value> 
         .collect()
 }
 
-fn cursor_additional_files(related_files: &[zeta_prompt::RelatedFile]) -> Vec<Value> {
+fn cursor_additional_files(
+    related_files: &[zeta_prompt::RelatedFile],
+    workspace_root: Option<&str>,
+) -> Vec<Value> {
     related_files
         .iter()
         .map(|file| {
+            let relative_path = normalize_cursor_context_path(&file.path, workspace_root);
             let visible_range_content = file
                 .excerpts
                 .iter()
@@ -585,7 +644,7 @@ fn cursor_additional_files(related_files: &[zeta_prompt::RelatedFile]) -> Vec<Va
                 .collect::<Vec<_>>();
 
             json!({
-                "relativeWorkspacePath": file.path.to_string_lossy(),
+                "relativeWorkspacePath": relative_path,
                 "isOpen": true,
                 "visibleRangeContent": visible_range_content,
                 "startLineNumberOneIndexed": start_line_number_one_indexed,
@@ -653,14 +712,18 @@ fn append_open_buffer_additional_files(
     }
 }
 
-fn cursor_code_results(related_files: &[zeta_prompt::RelatedFile]) -> Vec<Value> {
+fn cursor_code_results(
+    related_files: &[zeta_prompt::RelatedFile],
+    workspace_root: Option<&str>,
+) -> Vec<Value> {
     related_files
         .iter()
         .flat_map(|file| {
+            let relative_path = normalize_cursor_context_path(&file.path, workspace_root);
             file.excerpts.iter().map(move |excerpt| {
                 json!({
                     "codeBlock": {
-                        "relativeWorkspacePath": file.path.to_string_lossy(),
+                        "relativeWorkspacePath": relative_path,
                         "range": {
                             "startPosition": {
                                 "line": excerpt.row_range.start,
@@ -718,12 +781,17 @@ fn cursor_linter_errors(
     })
 }
 
-async fn lsp_suggested_labels(
+async fn lsp_suggestions(
     project: Entity<Project>,
     buffer: Entity<Buffer>,
     cursor_position: Anchor,
     cx: &mut AsyncApp,
-) -> Vec<String> {
+) -> Vec<CursorLspSuggestion> {
+    let query = cx.update(|cx| {
+        let snapshot = buffer.read(cx).snapshot();
+        cursor_lsp_completion_query(&snapshot, cursor_position)
+    });
+
     let completions_task = cx.update(|cx| {
         project.update(cx, |project, cx| {
             project.completions(
@@ -747,32 +815,343 @@ async fn lsp_suggested_labels(
 
     let responses = select_biased! {
         response = completions => response.unwrap_or_else(|err| {
-            log::debug!("failed to fetch LSP suggestions for Cursor payload: {err:#}");
+            log::warn!("failed to fetch LSP suggestions for Cursor payload: {err:#}");
             Vec::new()
         }),
-        () = timeout => Vec::new(),
+        () = timeout => {
+            log::debug!("timed out fetching LSP suggestions for Cursor payload");
+            Vec::new()
+        },
     };
 
-    let mut seen = HashSet::new();
-    responses
+    let completions = responses
         .into_iter()
         .flat_map(|response| response.completions)
-        .filter_map(|completion| cursor_lsp_suggestion_label(&completion))
-        .filter(|label| seen.insert(label.clone()))
+        .collect::<Vec<_>>();
+    if completions.is_empty() {
+        return Vec::new();
+    }
+
+    let completions = Rc::new(RefCell::new(completions.into_boxed_slice()));
+    let ranked_indices = {
+        let completions = completions.borrow();
+        rank_cursor_lsp_completion_indices(&completions, &query)
+    };
+
+    let resolve_indices = ranked_indices
+        .iter()
+        .copied()
+        .take(MAX_LSP_SUGGESTED_ITEMS_TO_RESOLVE)
+        .collect::<Vec<_>>();
+    if !resolve_indices.is_empty() {
+        let resolve_task = cx.update(|cx| {
+            project.update(cx, |project, cx| {
+                project.resolve_completions(
+                    buffer.clone(),
+                    resolve_indices,
+                    completions.clone(),
+                    cx,
+                )
+            })
+        });
+        let timeout = cx
+            .background_executor()
+            .timer(LSP_SUGGESTED_ITEMS_TIMEOUT)
+            .fuse();
+        let resolved = resolve_task.fuse();
+        futures::pin_mut!(resolved, timeout);
+        select_biased! {
+            result = resolved => {
+                if let Err(err) = result {
+                    log::debug!("failed to resolve LSP suggestions for Cursor payload: {err:#}");
+                }
+            },
+            () = timeout => {
+                log::debug!("timed out resolving LSP suggestions for Cursor payload");
+            },
+        }
+    }
+
+    let completions = completions.borrow();
+    let mut seen = HashSet::new();
+    ranked_indices
+        .into_iter()
+        .filter_map(|index| completions.get(index))
+        .filter_map(cursor_lsp_suggestion)
+        .filter(|suggestion| seen.insert(suggestion.label.clone()))
         .take(MAX_LSP_SUGGESTED_ITEMS)
         .collect()
 }
 
-fn cursor_lsp_suggestion_label(completion: &Completion) -> Option<String> {
-    completion
+fn cursor_lsp_completion_query(snapshot: &BufferSnapshot, cursor_position: Anchor) -> String {
+    let cursor = cursor_position.to_offset(snapshot);
+    let before_cursor = snapshot.text_for_range(0..cursor).collect::<String>();
+    let line_start = before_cursor
+        .rmatch_indices('\n')
+        .next()
+        .map_or(0, |(ix, _)| ix + 1);
+
+    before_cursor[line_start..]
+        .chars()
+        .rev()
+        .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == '$')
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect()
+}
+
+#[cfg(test)]
+fn rank_cursor_lsp_suggestion_labels(labels: Vec<String>, query: &str) -> Vec<String> {
+    rank_cursor_lsp_suggestions(
+        labels
+            .into_iter()
+            .map(|label| CursorLspSuggestion {
+                label,
+                source_module: None,
+                additional_text_edits: Vec::new(),
+            })
+            .collect(),
+        query,
+    )
+    .into_iter()
+    .map(|suggestion| suggestion.label)
+    .collect()
+}
+
+#[cfg(test)]
+fn rank_cursor_lsp_suggestions(
+    labels: Vec<CursorLspSuggestion>,
+    query: &str,
+) -> Vec<CursorLspSuggestion> {
+    let query = query.trim();
+    if query.is_empty() {
+        return labels;
+    }
+
+    let query_lower = query.to_lowercase();
+    let mut prefix_matches = Vec::new();
+    let mut fuzzy_matches = Vec::new();
+    let mut rest = Vec::new();
+
+    for suggestion in labels {
+        let label_lower = suggestion.label.to_lowercase();
+        if label_lower.starts_with(&query_lower) {
+            prefix_matches.push(suggestion);
+        } else if label_lower.contains(&query_lower) {
+            fuzzy_matches.push(suggestion);
+        } else {
+            rest.push(suggestion);
+        }
+    }
+
+    prefix_matches
+        .into_iter()
+        .chain(fuzzy_matches)
+        .chain(rest)
+        .collect()
+}
+
+fn rank_cursor_lsp_completion_indices(completions: &[Completion], query: &str) -> Vec<usize> {
+    let query = query.trim();
+    let query_lower = query.to_lowercase();
+    let mut prefix_matches = Vec::new();
+    let mut fuzzy_matches = Vec::new();
+    let mut rest = Vec::new();
+
+    for (index, completion) in completions.iter().enumerate() {
+        let Some(label) = cursor_lsp_completion_label(completion) else {
+            continue;
+        };
+        if query.is_empty() {
+            rest.push(index);
+            continue;
+        }
+
+        let label_lower = label.to_lowercase();
+        if label_lower.starts_with(&query_lower) {
+            prefix_matches.push(index);
+        } else if label_lower.contains(&query_lower) {
+            fuzzy_matches.push(index);
+        } else {
+            rest.push(index);
+        }
+    }
+
+    prefix_matches
+        .into_iter()
+        .chain(fuzzy_matches)
+        .chain(rest)
+        .collect()
+}
+
+fn cursor_lsp_suggestion(completion: &Completion) -> Option<CursorLspSuggestion> {
+    let lsp_completion = completion.source.lsp_completion(true);
+    let additional_text_edits = lsp_completion
+        .as_ref()
+        .and_then(|completion| completion.additional_text_edits.clone())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|edit| looks_like_import_text_edit(&edit.new_text))
+        .collect::<Vec<_>>();
+    let source_module = lsp_completion
+        .as_ref()
+        .and_then(|completion| cursor_lsp_completion_source_module(completion.as_ref()));
+
+    let label = cursor_lsp_completion_label(completion)?;
+    let source_module = source_module
+        .or_else(|| cursor_lsp_completion_source_module_from_label(&completion.label, &label));
+
+    Some(CursorLspSuggestion {
+        label: label.chars().take(MAX_LSP_SUGGESTED_LABEL_LEN).collect(),
+        source_module,
+        additional_text_edits,
+    })
+}
+
+fn cursor_lsp_completion_label(completion: &Completion) -> Option<String> {
+    let label = completion
         .source
-        .lsp_completion(false)
+        .lsp_completion(true)
+        .as_ref()
         .map(|completion| completion.label.trim().to_string())
         .or_else(|| {
             let label = completion.label.text.trim();
             (!label.is_empty()).then(|| label.to_string())
-        })
-        .filter(|label| !label.is_empty())
+        })?;
+
+    let label = label.trim();
+    if label.is_empty() || is_common_lsp_suggestion_label(label) {
+        return None;
+    }
+
+    Some(label.to_string())
+}
+
+fn looks_like_import_text_edit(text: &str) -> bool {
+    text.lines()
+        .any(|line| line.trim_start().starts_with("import "))
+}
+
+fn cursor_lsp_completion_source_module(completion: &lsp::CompletionItem) -> Option<String> {
+    let candidates = [
+        completion
+            .label_details
+            .as_ref()
+            .and_then(|details| details.description.as_deref()),
+        completion.detail.as_deref(),
+    ];
+
+    candidates
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|candidate| looks_like_import_source_module(candidate))
+        .map(str::to_string)
+}
+
+fn cursor_lsp_completion_source_module_from_label(
+    completion_label: &language::CodeLabel,
+    label: &str,
+) -> Option<String> {
+    let text = completion_label.text();
+    let suffix = text
+        .get(completion_label.filter_range.end..)
+        .or_else(|| text.strip_prefix(label))?
+        .trim();
+    let suffix = suffix
+        .trim_start_matches(|ch: char| ch.is_whitespace() || ch == '-' || ch == ':' || ch == '—')
+        .trim();
+
+    looks_like_import_source_module(suffix).then(|| suffix.to_string())
+}
+
+fn looks_like_import_source_module(source: &str) -> bool {
+    !source.is_empty()
+        && !source.contains(char::is_whitespace)
+        && !source.contains('(')
+        && !source.contains(')')
+        && (source.starts_with('.')
+            || source.starts_with('@')
+            || source.contains('/')
+            || source.contains('-'))
+}
+
+fn cursor_lsp_suggestion_matches_prediction(label: &str, predicted_text: &str) -> bool {
+    let label = label.trim();
+    if label.is_empty() || predicted_text.is_empty() {
+        return false;
+    }
+
+    predicted_text
+        .match_indices(label)
+        .any(|(index, _)| is_identifier_boundary(predicted_text, index, label.len()))
+}
+
+fn is_identifier_boundary(text: &str, start: usize, len: usize) -> bool {
+    let before = text[..start].chars().next_back();
+    let after = text[start + len..].chars().next();
+
+    !before.is_some_and(is_identifier_char) && !after.is_some_and(is_identifier_char)
+}
+
+fn is_identifier_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_' || ch == '$'
+}
+
+fn is_common_lsp_suggestion_label(label: &str) -> bool {
+    matches!(
+        label,
+        "arguments"
+            | "async"
+            | "await"
+            | "break"
+            | "case"
+            | "catch"
+            | "class"
+            | "const"
+            | "continue"
+            | "debugger"
+            | "default"
+            | "delete"
+            | "do"
+            | "else"
+            | "enum"
+            | "export"
+            | "extends"
+            | "false"
+            | "finally"
+            | "for"
+            | "function"
+            | "if"
+            | "implements"
+            | "import"
+            | "in"
+            | "instanceof"
+            | "interface"
+            | "let"
+            | "new"
+            | "null"
+            | "package"
+            | "private"
+            | "protected"
+            | "public"
+            | "return"
+            | "static"
+            | "super"
+            | "switch"
+            | "this"
+            | "throw"
+            | "true"
+            | "try"
+            | "typeof"
+            | "undefined"
+            | "var"
+            | "void"
+            | "while"
+            | "with"
+            | "yield"
+    )
 }
 
 fn cursor_lsp_suggested_items(labels: &[String]) -> Value {
@@ -782,6 +1161,25 @@ fn cursor_lsp_suggested_items(labels: &[String]) -> Value {
             .filter_map(|label| {
                 let label = label.trim();
                 (!label.is_empty()).then(|| json!({ "label": label }))
+            })
+            .collect::<Vec<_>>()
+    })
+}
+
+fn cursor_lsp_suggestion_metadata(suggestions: &[CursorLspSuggestion]) -> Value {
+    json!({
+        "lspSuggestions": suggestions
+            .iter()
+            .map(|suggestion| {
+                json!({
+                    "label": suggestion.label,
+                    "sourceModule": suggestion.source_module,
+                    "importEditCount": suggestion.additional_text_edits.len(),
+                    "importEditPreviews": suggestion.additional_text_edits
+                        .iter()
+                        .map(|edit| edit.new_text.chars().take(200).collect::<String>())
+                        .collect::<Vec<_>>(),
+                })
             })
             .collect::<Vec<_>>()
     })
@@ -844,6 +1242,7 @@ async fn prediction_from_response(
     snapshot: &BufferSnapshot,
     current_path: String,
     response: ExternalEditPredictionResponse,
+    lsp_suggestions: &[CursorLspSuggestion],
     cx: &mut AsyncApp,
 ) -> Result<Option<CurrentExternalPrediction>> {
     let mut local_edits = Vec::new();
@@ -868,6 +1267,24 @@ async fn prediction_from_response(
     }
 
     if !local_edits.is_empty() {
+        let mut local_edits = local_edits;
+        let prediction_edits: Arc<[_]> = local_edits.clone().into();
+        local_edits.extend(
+            preview_lsp_completion_import_edits(snapshot, &prediction_edits, lsp_suggestions)
+                .into_iter(),
+        );
+        local_edits.extend(
+            preview_import_quick_fix_edits(
+                project,
+                buffer,
+                snapshot,
+                &current_path,
+                &prediction_edits,
+                cx,
+            )
+            .await?
+            .into_iter(),
+        );
         let edits: Arc<[_]> = local_edits.into();
         let edit_preview = buffer
             .read_with(cx, |buffer, cx| buffer.preview_edits(edits.clone(), cx))
@@ -886,6 +1303,272 @@ async fn prediction_from_response(
     }
 
     Ok(None)
+}
+
+fn preview_lsp_completion_import_edits(
+    snapshot: &BufferSnapshot,
+    prediction_edits: &[(Range<Anchor>, Arc<str>)],
+    lsp_suggestions: &[CursorLspSuggestion],
+) -> Vec<(Range<Anchor>, Arc<str>)> {
+    let predicted_text = prediction_edits
+        .iter()
+        .map(|(_, text)| text.as_ref())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if predicted_text.trim().is_empty() {
+        return Vec::new();
+    }
+
+    let mut seen = HashSet::new();
+    lsp_suggestions
+        .iter()
+        .filter(|suggestion| {
+            cursor_lsp_suggestion_matches_prediction(&suggestion.label, &predicted_text)
+        })
+        .flat_map(|suggestion| {
+            let lsp_edits = suggestion
+                .additional_text_edits
+                .iter()
+                .filter_map(|edit| {
+                    lsp_text_edit_to_prediction_edit(snapshot, &edit.range, &edit.new_text)
+                })
+                .collect::<Vec<_>>();
+            if !lsp_edits.is_empty() {
+                return lsp_edits;
+            }
+
+            suggestion
+                .source_module
+                .as_deref()
+                .and_then(|source_module| {
+                    synthesize_import_prediction_edit(snapshot, &suggestion.label, source_module)
+                })
+                .into_iter()
+                .collect()
+        })
+        .filter_map(|converted| {
+            let start = converted.0.start.to_offset(snapshot);
+            let end = converted.0.end.to_offset(snapshot);
+            let text = converted.1.to_string();
+            seen.insert((start, end, text)).then_some(converted)
+        })
+        .collect()
+}
+
+fn synthesize_import_prediction_edit(
+    snapshot: &BufferSnapshot,
+    label: &str,
+    source_module: &str,
+) -> Option<(Range<Anchor>, Arc<str>)> {
+    let label = label.trim();
+    if label.is_empty() || label.chars().any(|ch| !is_identifier_char(ch) || ch == '$') {
+        return None;
+    }
+
+    let contents = snapshot
+        .text_for_range(Point::new(0, 0)..snapshot.max_point())
+        .collect::<String>();
+    if contents.contains(&format!("{{ {label} }} from '{source_module}'"))
+        || contents.contains(&format!("{{{label}}} from '{source_module}'"))
+        || contents.contains(&format!("{{ {label} }} from \"{source_module}\""))
+        || contents.contains(&format!("{{{label}}} from \"{source_module}\""))
+    {
+        return None;
+    }
+
+    if let Some(edit) =
+        synthesize_existing_named_import_edit(snapshot, &contents, label, source_module)
+    {
+        return Some(edit);
+    }
+
+    synthesize_new_named_import_edit(snapshot, &contents, label, source_module)
+}
+
+fn synthesize_existing_named_import_edit(
+    snapshot: &BufferSnapshot,
+    contents: &str,
+    label: &str,
+    source_module: &str,
+) -> Option<(Range<Anchor>, Arc<str>)> {
+    let mut offset = 0;
+    for line in contents.split_inclusive('\n') {
+        let trimmed = line.trim();
+        let imports_source = (trimmed.contains(&format!("from '{source_module}'"))
+            || trimmed.contains(&format!("from \"{source_module}\"")))
+            && trimmed.starts_with("import ");
+        if imports_source
+            && let Some(open_brace) = line.find('{')
+            && let Some(close_brace) = line.rfind('}')
+        {
+            let names = &line[open_brace + 1..close_brace];
+            if names
+                .split(',')
+                .any(|name| name.split_whitespace().next() == Some(label))
+            {
+                return None;
+            }
+
+            let insertion_offset = offset + close_brace;
+            let insertion = if names.trim().is_empty() {
+                label.to_string()
+            } else {
+                format!(", {label}")
+            };
+            let anchor = snapshot.anchor_after(insertion_offset);
+            return Some((anchor..anchor, insertion.into()));
+        }
+        offset += line.len();
+    }
+
+    None
+}
+
+fn synthesize_new_named_import_edit(
+    snapshot: &BufferSnapshot,
+    contents: &str,
+    label: &str,
+    source_module: &str,
+) -> Option<(Range<Anchor>, Arc<str>)> {
+    let mut insert_offset = 0;
+    let mut saw_import = false;
+    let mut offset = 0;
+    for line in contents.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("import ") || (saw_import && trimmed.is_empty()) {
+            saw_import = true;
+            insert_offset = offset + line.len();
+        } else if saw_import {
+            break;
+        }
+        offset += line.len();
+    }
+
+    let import = format!("import {{ {label} }} from '{source_module}';\n");
+    let anchor = snapshot.anchor_after(insert_offset);
+    Some((anchor..anchor, import.into()))
+}
+
+async fn preview_import_quick_fix_edits(
+    project: &Entity<Project>,
+    buffer: &Entity<Buffer>,
+    snapshot: &BufferSnapshot,
+    current_path: &str,
+    prediction_edits: &[(Range<Anchor>, Arc<str>)],
+    cx: &mut AsyncApp,
+) -> Result<Vec<(Range<Anchor>, Arc<str>)>> {
+    let range = accepted_edit_search_range(snapshot, prediction_edits);
+    let actions = project
+        .update(cx, |project, cx| {
+            project.code_actions(
+                buffer,
+                range,
+                Some(import_quick_fix_code_action_kinds()),
+                cx,
+            )
+        })
+        .await?
+        .unwrap_or_default();
+
+    let Some(action) = select_import_quick_fix_attempt(actions) else {
+        return Ok(Vec::new());
+    };
+
+    Ok(import_workspace_edit_for_current_buffer(
+        snapshot,
+        current_path,
+        &action,
+    ))
+}
+
+fn import_workspace_edit_for_current_buffer(
+    snapshot: &BufferSnapshot,
+    current_path: &str,
+    action: &CodeAction,
+) -> Vec<(Range<Anchor>, Arc<str>)> {
+    let Some(workspace_edit) = action.lsp_action.edit() else {
+        return Vec::new();
+    };
+    let current_path = Path::new(current_path);
+    let mut edits = Vec::new();
+
+    if let Some(changes) = &workspace_edit.changes {
+        for (uri, text_edits) in changes {
+            if uri.to_file_path().as_deref() != Ok(current_path) {
+                continue;
+            }
+            edits.extend(text_edits.iter().filter_map(|edit| {
+                lsp_text_edit_to_prediction_edit(snapshot, &edit.range, &edit.new_text)
+            }));
+        }
+    }
+
+    if let Some(document_changes) = &workspace_edit.document_changes {
+        match document_changes {
+            lsp::DocumentChanges::Edits(document_edits) => {
+                for edit in document_edits {
+                    if edit.text_document.uri.to_file_path().as_deref() != Ok(current_path) {
+                        continue;
+                    }
+                    edits.extend(edit.edits.iter().filter_map(|edit| {
+                        let plain_edit = match edit {
+                            lsp::Edit::Plain(edit) => edit,
+                            lsp::Edit::Annotated(edit) => &edit.text_edit,
+                            lsp::Edit::Snippet(_) => return None,
+                        };
+                        lsp_text_edit_to_prediction_edit(
+                            snapshot,
+                            &plain_edit.range,
+                            &plain_edit.new_text,
+                        )
+                    }));
+                }
+            }
+            lsp::DocumentChanges::Operations(operations) => {
+                for operation in operations {
+                    let lsp::DocumentChangeOperation::Edit(edit) = operation else {
+                        continue;
+                    };
+                    if edit.text_document.uri.to_file_path().as_deref() != Ok(current_path) {
+                        continue;
+                    }
+                    edits.extend(edit.edits.iter().filter_map(|edit| {
+                        let plain_edit = match edit {
+                            lsp::Edit::Plain(edit) => edit,
+                            lsp::Edit::Annotated(edit) => &edit.text_edit,
+                            lsp::Edit::Snippet(_) => return None,
+                        };
+                        lsp_text_edit_to_prediction_edit(
+                            snapshot,
+                            &plain_edit.range,
+                            &plain_edit.new_text,
+                        )
+                    }));
+                }
+            }
+        }
+    }
+
+    edits
+}
+
+fn lsp_text_edit_to_prediction_edit(
+    snapshot: &BufferSnapshot,
+    range: &lsp::Range,
+    new_text: &str,
+) -> Option<(Range<Anchor>, Arc<str>)> {
+    let start = snapshot.clip_point(
+        Point::new(range.start.line, range.start.character),
+        Bias::Left,
+    );
+    let end = snapshot.clip_point(Point::new(range.end.line, range.end.character), Bias::Left);
+    if start > end {
+        return None;
+    }
+    Some((
+        snapshot.anchor_before(start)..snapshot.anchor_after(end),
+        Arc::from(new_text),
+    ))
 }
 
 async fn apply_import_quick_fix_after_accept(
@@ -1286,20 +1969,24 @@ impl From<Point> for ExternalPosition {
 #[cfg(test)]
 mod tests {
     use super::{
-        CurrentExternalPrediction, EditPrediction, accepted_edit_search_range, cursor_diagnostics,
-        cursor_linter_errors, cursor_lsp_suggested_items, edit_prediction_from_current_prediction,
-        external_accept_url, external_partial_accept_url, external_reject_url,
-        import_quick_fix_code_action_kinds, is_import_code_action, select_import_quick_fix,
+        CurrentExternalPrediction, CursorLspSuggestion, EditPrediction,
+        MAX_LSP_SUGGESTED_LABEL_LEN, accepted_edit_search_range, cursor_diagnostics,
+        cursor_linter_errors, cursor_lsp_completion_source_module_from_label,
+        cursor_lsp_suggested_items, edit_prediction_from_current_prediction, external_accept_url,
+        external_partial_accept_url, external_reject_url, import_quick_fix_code_action_kinds,
+        import_workspace_edit_for_current_buffer, is_common_lsp_suggestion_label,
+        is_import_code_action, normalize_cursor_context_path, preview_lsp_completion_import_edits,
+        rank_cursor_lsp_suggestion_labels, select_import_quick_fix,
         select_import_quick_fix_from_attempts,
     };
     use db::AppDatabase;
     use gpui::{AppContext as _, TestAppContext};
-    use language::Buffer;
+    use language::{Buffer, CodeLabel, ToPoint as _};
     use lsp::LanguageServerId;
     use project::{CodeAction, LspAction};
     use serde_json::json;
     use settings::SettingsStore;
-    use std::sync::Arc;
+    use std::{path::Path, sync::Arc};
 
     fn init_test(cx: &mut TestAppContext) {
         cx.update(|cx| {
@@ -1427,6 +2114,78 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_common_lsp_suggestion_labels_are_filtered() {
+        assert!(is_common_lsp_suggestion_label("const"));
+        assert!(is_common_lsp_suggestion_label("undefined"));
+        assert!(!is_common_lsp_suggestion_label("nullthrows"));
+        assert_eq!(MAX_LSP_SUGGESTED_LABEL_LEN, 10_000);
+    }
+
+    #[test]
+    fn test_cursor_lsp_suggestion_labels_are_ranked_by_current_query() {
+        assert_eq!(
+            rank_cursor_lsp_suggestion_labels(
+                vec![
+                    "AbiModule".to_string(),
+                    "AdminAuthMiddleware".to_string(),
+                    "nullthrows".to_string(),
+                    "notNullish".to_string(),
+                ],
+                "nullth",
+            ),
+            vec![
+                "nullthrows".to_string(),
+                "AbiModule".to_string(),
+                "AdminAuthMiddleware".to_string(),
+                "notNullish".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_lsp_completion_source_module_is_extracted_from_display_label() {
+        let label =
+            CodeLabel::filtered("nullthrows shared-utils".to_string(), 10, None, Vec::new());
+
+        assert_eq!(
+            cursor_lsp_completion_source_module_from_label(&label, "nullthrows").as_deref(),
+            Some("shared-utils")
+        );
+    }
+
+    #[test]
+    fn test_lsp_completion_source_module_label_fallback_ignores_plain_label() {
+        let label = CodeLabel::filtered("nullthrows".to_string(), 10, None, Vec::new());
+
+        assert_eq!(
+            cursor_lsp_completion_source_module_from_label(&label, "nullthrows"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_normalize_cursor_context_path_removes_workspace_prefix() {
+        assert_eq!(
+            normalize_cursor_context_path(
+                Path::new("acme-monorepo/frontend/src/file.ts"),
+                Some("/Users/example/projects/acme-monorepo"),
+            ),
+            "frontend/src/file.ts"
+        );
+        assert_eq!(
+            normalize_cursor_context_path(
+                Path::new("/Users/example/projects/acme-monorepo/frontend/src/file.ts"),
+                Some("/Users/example/projects/acme-monorepo"),
+            ),
+            "frontend/src/file.ts"
+        );
+        assert_eq!(
+            normalize_cursor_context_path(Path::new("frontend/src/file.ts"), None),
+            "frontend/src/file.ts"
+        );
+    }
+
     #[gpui::test]
     async fn test_external_jump_preserves_should_retrigger(cx: &mut TestAppContext) {
         init_test(cx);
@@ -1511,6 +2270,31 @@ mod tests {
             lsp_action: LspAction::Action(Box::new(lsp::CodeAction {
                 title: title.into(),
                 kind: Some(kind),
+                ..Default::default()
+            })),
+            resolved: true,
+        }
+    }
+
+    fn test_code_action_with_edit(
+        title: &str,
+        kind: lsp::CodeActionKind,
+        edit_path: &Path,
+        edit: lsp::TextEdit,
+    ) -> CodeAction {
+        let buffer_id = text::BufferId::new(1).unwrap();
+        CodeAction {
+            server_id: LanguageServerId(0),
+            range: language::Anchor::min_for_buffer(buffer_id)
+                ..language::Anchor::min_for_buffer(buffer_id),
+            lsp_action: LspAction::Action(Box::new(lsp::CodeAction {
+                title: title.into(),
+                kind: Some(kind),
+                edit: Some(lsp::WorkspaceEdit::new(
+                    [(lsp::Uri::from_file_path(edit_path).unwrap(), vec![edit])]
+                        .into_iter()
+                        .collect(),
+                )),
                 ..Default::default()
             })),
             resolved: true,
@@ -1602,6 +2386,171 @@ mod tests {
         assert_eq!(
             selected.lsp_action.title(),
             "Import 'nullthrows' from module \"shared-utils\""
+        );
+    }
+
+    #[gpui::test]
+    async fn test_import_workspace_edit_is_previewed_for_current_buffer(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let buffer = cx.new(|cx| Buffer::local("const value = nullthrows(foo);\n", cx));
+        let snapshot = buffer.read_with(cx, |buffer, _cx| buffer.snapshot());
+        let action = test_code_action_with_edit(
+            "Import 'nullthrows' from module \"shared-utils\"",
+            lsp::CodeActionKind::QUICKFIX,
+            Path::new("/tmp/file.ts"),
+            lsp::TextEdit::new(
+                lsp::Range::new(lsp::Position::new(0, 0), lsp::Position::new(0, 0)),
+                "import { nullthrows } from 'shared-utils';\n\n".to_string(),
+            ),
+        );
+
+        let edits = import_workspace_edit_for_current_buffer(&snapshot, "/tmp/file.ts", &action);
+
+        assert_eq!(edits.len(), 1);
+        assert_eq!(
+            edits[0].0.start.to_point(&snapshot)..edits[0].0.end.to_point(&snapshot),
+            language::Point::new(0, 0)..language::Point::new(0, 0)
+        );
+        assert_eq!(
+            edits[0].1.as_ref(),
+            "import { nullthrows } from 'shared-utils';\n\n"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_import_workspace_edit_ignores_other_buffers(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let buffer = cx.new(|cx| Buffer::local("const value = nullthrows(foo);\n", cx));
+        let snapshot = buffer.read_with(cx, |buffer, _cx| buffer.snapshot());
+        let action = test_code_action_with_edit(
+            "Import 'nullthrows' from module \"shared-utils\"",
+            lsp::CodeActionKind::QUICKFIX,
+            Path::new("/tmp/other.ts"),
+            lsp::TextEdit::new(
+                lsp::Range::new(lsp::Position::new(0, 0), lsp::Position::new(0, 0)),
+                "import { nullthrows } from 'shared-utils';\n\n".to_string(),
+            ),
+        );
+
+        let edits = import_workspace_edit_for_current_buffer(&snapshot, "/tmp/file.ts", &action);
+
+        assert!(edits.is_empty());
+    }
+
+    #[gpui::test]
+    async fn test_lsp_completion_import_edit_is_previewed_when_prediction_uses_label(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let buffer = cx.new(|cx| Buffer::local("const value = \n", cx));
+        let snapshot = buffer.read_with(cx, |buffer, _cx| buffer.snapshot());
+        let prediction_edits = vec![(
+            snapshot.anchor_before(language::Point::new(0, 14))
+                ..snapshot.anchor_after(language::Point::new(0, 14)),
+            Arc::<str>::from("nullthrows(foo);"),
+        )];
+        let suggestions = vec![CursorLspSuggestion {
+            label: "nullthrows".to_string(),
+            source_module: None,
+            additional_text_edits: vec![lsp::TextEdit::new(
+                lsp::Range::new(lsp::Position::new(0, 0), lsp::Position::new(0, 0)),
+                "import { nullthrows } from 'shared-utils';\n\n".to_string(),
+            )],
+        }];
+
+        let edits = preview_lsp_completion_import_edits(&snapshot, &prediction_edits, &suggestions);
+
+        assert_eq!(edits.len(), 1);
+        assert_eq!(
+            edits[0].0.start.to_point(&snapshot)..edits[0].0.end.to_point(&snapshot),
+            language::Point::new(0, 0)..language::Point::new(0, 0)
+        );
+        assert_eq!(
+            edits[0].1.as_ref(),
+            "import { nullthrows } from 'shared-utils';\n\n"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_lsp_completion_import_edit_requires_identifier_match(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let buffer = cx.new(|cx| Buffer::local("const value = \n", cx));
+        let snapshot = buffer.read_with(cx, |buffer, _cx| buffer.snapshot());
+        let prediction_edits = vec![(
+            snapshot.anchor_before(language::Point::new(0, 14))
+                ..snapshot.anchor_after(language::Point::new(0, 14)),
+            Arc::<str>::from("renullthrowsValue"),
+        )];
+        let suggestions = vec![CursorLspSuggestion {
+            label: "nullthrows".to_string(),
+            source_module: None,
+            additional_text_edits: vec![lsp::TextEdit::new(
+                lsp::Range::new(lsp::Position::new(0, 0), lsp::Position::new(0, 0)),
+                "import { nullthrows } from 'shared-utils';\n\n".to_string(),
+            )],
+        }];
+
+        assert!(
+            preview_lsp_completion_import_edits(&snapshot, &prediction_edits, &suggestions)
+                .is_empty()
+        );
+    }
+
+    #[gpui::test]
+    async fn test_lsp_completion_source_module_updates_existing_import(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let buffer = cx.new(|cx| {
+            Buffer::local(
+                "import { existingHelper } from 'shared-utils';\n\nconst value = \n",
+                cx,
+            )
+        });
+        let snapshot = buffer.read_with(cx, |buffer, _cx| buffer.snapshot());
+        let prediction_edits = vec![(
+            snapshot.anchor_before(language::Point::new(2, 14))
+                ..snapshot.anchor_after(language::Point::new(2, 14)),
+            Arc::<str>::from("nullthrows(foo);"),
+        )];
+        let suggestions = vec![CursorLspSuggestion {
+            label: "nullthrows".to_string(),
+            source_module: Some("shared-utils".to_string()),
+            additional_text_edits: Vec::new(),
+        }];
+
+        let edits = preview_lsp_completion_import_edits(&snapshot, &prediction_edits, &suggestions);
+
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].1.as_ref(), ", nullthrows");
+    }
+
+    #[gpui::test]
+    async fn test_lsp_completion_source_module_inserts_new_import(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let buffer = cx.new(|cx| Buffer::local("const value = \n", cx));
+        let snapshot = buffer.read_with(cx, |buffer, _cx| buffer.snapshot());
+        let prediction_edits = vec![(
+            snapshot.anchor_before(language::Point::new(0, 14))
+                ..snapshot.anchor_after(language::Point::new(0, 14)),
+            Arc::<str>::from("nullthrows(foo);"),
+        )];
+        let suggestions = vec![CursorLspSuggestion {
+            label: "nullthrows".to_string(),
+            source_module: Some("shared-utils".to_string()),
+            additional_text_edits: Vec::new(),
+        }];
+
+        let edits = preview_lsp_completion_import_edits(&snapshot, &prediction_edits, &suggestions);
+
+        assert_eq!(edits.len(), 1);
+        assert_eq!(
+            edits[0].1.as_ref(),
+            "import { nullthrows } from 'shared-utils';\n"
         );
     }
 
